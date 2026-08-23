@@ -115,7 +115,7 @@ uv run pytest tests/integration/test_real_qoder_auditor.py -m real_qoder -q
 | Completion | Main result plus nested settlement; missing terminal telemetry becomes an explicit warning |
 | Runtime | SDK-bundled QoderCLI by default; external runtime is an explicit tested override |
 
-## Planned directory structure
+## Project structure
 
 ```text
 dogqoder/
@@ -130,8 +130,9 @@ dogqoder/
 └── uv.lock
 ```
 
-Implementation code and tests are intentionally absent until the approved
-design has been converted into a tracer-bullet implementation plan.
+Tracer Bullet 1 implementation and tests now exist under `src/qworker` and
+`tests`. Later supervisor, persistence, RPC, and core CLI tracer bullets remain
+planned and will extend this structure.
 
 ## Agent workflow
 
@@ -146,8 +147,8 @@ read README
 ```
 
 The first tracer bullet is a foreground, single-worker, read-only auditor using
-the public SDK. It must prove initialization, model resolution, event reduction,
-and structured completion before the daemon and full CLI are added.
+the public SDK. It proves initialization, model resolution, event reduction, and
+structured completion; the daemon and full CLI remain planned.
 
 ## Technical stack
 

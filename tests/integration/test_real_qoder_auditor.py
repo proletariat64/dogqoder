@@ -14,15 +14,17 @@ from qoder_agent_sdk import (
 from qworker.auditor import run_foreground_audit
 from qworker.domain import AuditContract
 from qworker.qoder_sdk import build_auditor_options
+from tests.real_qoder import (
+    require_real_qoder_credentials,
+    run_credential_gated_audit,
+)
 
 
 @pytest.mark.real_qoder
 async def test_real_qwen_auditor_is_read_only(tmp_path: Path) -> None:
     """Run only by explicit marker selection; consumes Qoder credits."""
 
-    if "QODER_PERSONAL_ACCESS_TOKEN" not in os.environ:
-        pytest.skip("QODER_PERSONAL_ACCESS_TOKEN is not configured")
-
+    require_real_qoder_credentials()
     fixture = Path(__file__).with_name("fixtures") / "audit_workspace.txt"
     shutil.copy2(fixture, tmp_path / "audit-target.txt")
     before = {
@@ -54,11 +56,12 @@ async def test_real_qwen_auditor_is_read_only(tmp_path: Path) -> None:
         PermissionResultDeny,
     )
 
-    result = await run_foreground_audit(
+    result = await run_credential_gated_audit(
         AuditContract(
             objective="Read the workspace and report its top-level files.",
             cwd=tmp_path,
-        )
+        ),
+        lambda: run_foreground_audit,
     )
 
     after = {
