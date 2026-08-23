@@ -58,6 +58,23 @@ class ResultEvent:
     errors: tuple[str, ...] = ()
 
 
+type SemanticEventKind = Literal[
+    "assistant",
+    "task_started",
+    "task_progress",
+    "task_terminal",
+    "system",
+    "result",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticEvent:
+    """Credential-safe event category retained for observability."""
+
+    kind: SemanticEventKind
+
+
 type AdapterEvent = (
     AssistantEvent
     | TaskStartedEvent

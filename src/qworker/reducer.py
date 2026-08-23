@@ -8,6 +8,9 @@ from qworker.events import (
     AdapterEvent,
     AssistantEvent,
     ResultEvent,
+    SemanticEvent,
+    SystemEvent,
+    TaskProgressEvent,
     TaskStartedEvent,
     TaskTerminalEvent,
 )
@@ -26,7 +29,7 @@ class ResultReducer:
         self._active_task_ids: set[str] = set()
         self._actual_models: list[str] = []
         self._result: ResultEvent | None = None
-        self._semantic_events: list[AdapterEvent] = []
+        self._semantic_events: list[SemanticEvent] = []
 
     @property
     def needs_settlement(self) -> bool:
@@ -35,8 +38,8 @@ class ResultReducer:
         return self._result is not None and bool(self._active_task_ids)
 
     @property
-    def semantic_events(self) -> tuple[AdapterEvent, ...]:
-        """Bounded normalized telemetry, in receive order."""
+    def semantic_events(self) -> tuple[SemanticEvent, ...]:
+        """Bounded credential-safe telemetry categories, in receive order."""
 
         return tuple(self._semantic_events)
 
@@ -112,7 +115,21 @@ class ResultReducer:
     def _record(self, event: AdapterEvent) -> None:
         if len(self._semantic_events) == _MAX_SEMANTIC_EVENTS:
             self._semantic_events.pop(0)
-        self._semantic_events.append(event)
+        self._semantic_events.append(self._semantic_event(event))
+
+    @staticmethod
+    def _semantic_event(event: AdapterEvent) -> SemanticEvent:
+        if isinstance(event, AssistantEvent):
+            return SemanticEvent(kind="assistant")
+        if isinstance(event, TaskStartedEvent):
+            return SemanticEvent(kind="task_started")
+        if isinstance(event, TaskProgressEvent):
+            return SemanticEvent(kind="task_progress")
+        if isinstance(event, TaskTerminalEvent):
+            return SemanticEvent(kind="task_terminal")
+        if isinstance(event, SystemEvent):
+            return SemanticEvent(kind="system")
+        return SemanticEvent(kind="result")
 
     def _record_model(self, model: str | None) -> None:
         if model is not None and model not in self._actual_models:
