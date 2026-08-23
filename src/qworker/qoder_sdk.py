@@ -15,6 +15,7 @@ from typing import Any, Literal, Protocol, cast
 
 from qoder_agent_sdk import (
     AccessTokenAuthOptions,
+    AccessTokenEnvVar,
     AssistantMessage,
     AuthAccessTokenEnvVarError,
     AuthNotConfiguredError,
@@ -29,6 +30,7 @@ from qoder_agent_sdk import (
     ResultMessage,
     SDKPermissionDeniedMessage,
     ServiceAccountAuthOptions,
+    ServiceAccountEnvVar,
     SystemMessage,
     TaskNotificationMessage,
     TaskProgressMessage,
@@ -196,6 +198,7 @@ class QoderSDKTransport:
     def __init__(self, client: object) -> None:
         self._client = cast(_SDKClient, client)
         self._credential_values = _direct_credential_values(client)
+        self._model_identifiers: dict[str, str] = {}
 
     async def connect(self) -> None:
         await _call_sdk(
@@ -208,16 +211,25 @@ class QoderSDKTransport:
         async def load_catalog() -> tuple[AvailableModel, ...]:
             catalog = await self._client.get_available_models()
             models: list[AvailableModel] = []
+            identifiers: dict[str, str] = {}
             for item in catalog:
-                value = item.get("value")
+                identifier = item.get("value")
+                display_name = item.get("displayName")
                 enabled = item.get("isEnabled")
-                if isinstance(value, str) and isinstance(enabled, bool):
+                if isinstance(identifier, str) and isinstance(enabled, bool):
+                    safe_identifier = _redact(identifier, self._credential_values)
+                    value = (
+                        display_name if isinstance(display_name, str) else identifier
+                    )
+                    safe_value = _redact(value, self._credential_values)
+                    identifiers[safe_value] = safe_identifier
                     models.append(
                         AvailableModel(
-                            value=_redact(value, self._credential_values),
+                            value=safe_value,
                             enabled=enabled,
                         )
                     )
+            self._model_identifiers = identifiers
             return tuple(models)
 
         return await _call_sdk(
@@ -227,8 +239,9 @@ class QoderSDKTransport:
         )
 
     async def select_model(self, model: str) -> None:
+        identifier = self._model_identifiers.get(model, model)
         await _call_sdk(
-            lambda: self._client.set_model(model),
+            lambda: self._client.set_model(identifier),
             operation="model_selection",
             credential_values=self._credential_values,
         )
@@ -403,16 +416,20 @@ def _direct_credential_values(client: object) -> tuple[str, ...]:
     if not isinstance(options, QoderAgentOptions):
         return ()
     auth = options.auth
-    if (
-        isinstance(auth, AccessTokenAuthOptions)
-        and isinstance(auth.access_token, str)
-        and auth.access_token
-    ):
-        return (auth.access_token,)
-    if (
-        isinstance(auth, ServiceAccountAuthOptions)
-        and isinstance(auth.service_account_key, str)
-        and auth.service_account_key
-    ):
-        return (auth.service_account_key,)
+    if isinstance(auth, AccessTokenAuthOptions):
+        value = _auth_input_value(auth.access_token)
+        return (value,) if value else ()
+    if isinstance(auth, ServiceAccountAuthOptions):
+        value = _auth_input_value(auth.service_account_key)
+        return (value,) if value else ()
     return ()
+
+
+def _auth_input_value(
+    credential: str | AccessTokenEnvVar | ServiceAccountEnvVar | None,
+) -> str | None:
+    if isinstance(credential, str):
+        return credential
+    if isinstance(credential, (AccessTokenEnvVar, ServiceAccountEnvVar)):
+        return os.environ.get(credential.env_var)
+    return None

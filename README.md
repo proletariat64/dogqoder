@@ -5,9 +5,8 @@ Codex continues using its native OpenAI provider. It is designed for work that
 benefits from Qoder's model catalog—especially `Qwen3.8-Max`—without switching
 the main Codex session to another provider.
 
-The project is currently at the approved-design stage. The SDK integration has
-been proven against a real Qoder session; the production supervisor and CLI are
-the next implementation work.
+The first tracer bullet now runs a foreground, read-only Qoder auditor end to
+end. The production supervisor and CLI are the next implementation work.
 
 ## Goals
 
@@ -83,6 +82,23 @@ The feasibility probe performs a real, credit-consuming Qoder request:
 
 ```bash
 uv run python spikes/qoder_audit_probe.py
+```
+
+## Foreground auditor verification
+
+Default tests never contact Qoder and exclude the `real_qoder` marker:
+
+```bash
+uv run pytest -q
+```
+
+The real integration uses the SDK-bundled QoderCLI, copies one harmless fixture
+to a disposable pytest workspace, enforces the read-only auditor policy, and
+consumes Qoder credits. Export `QODER_PERSONAL_ACCESS_TOKEN` without writing its
+value to repository configuration, then opt in explicitly:
+
+```bash
+uv run pytest tests/integration/test_real_qoder_auditor.py -m real_qoder -q
 ```
 
 ## Core mechanisms

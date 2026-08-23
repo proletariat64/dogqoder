@@ -1,4 +1,4 @@
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -20,7 +20,9 @@ from qoder_agent_sdk import (
     ToolPermissionContext,
     ToolUseBlock,
     access_token,
+    access_token_from_env,
     service_account,
+    service_account_from_env,
 )
 
 from qworker.events import (
@@ -31,6 +33,7 @@ from qworker.events import (
     TaskStartedEvent,
     TaskTerminalEvent,
 )
+from qworker.model_policy import AvailableModel
 from qworker.qoder_sdk import (
     AdapterDiagnostic,
     QoderSDKTransport,
@@ -149,6 +152,25 @@ async def test_transport_initializes_selects_model_then_sends() -> None:
     ]
 
 
+async def test_model_catalog_uses_display_name_and_selects_sdk_identifier() -> None:
+    client = FakeSDKClient(
+        models=[
+            {
+                "value": "qmodel_38max",
+                "displayName": "Qwen3.8-Max",
+                "isEnabled": True,
+            }
+        ]
+    )
+    transport = QoderSDKTransport(client)
+
+    models = await transport.available_models()
+    await transport.select_model("Qwen3.8-Max")
+
+    assert models == (AvailableModel(value="Qwen3.8-Max", enabled=True),)
+    assert client.calls == ["models", "model:qmodel_38max"]
+
+
 async def test_nested_mutation_is_denied_at_callback_boundary(
     tmp_path: Path,
 ) -> None:
@@ -239,6 +261,33 @@ async def test_injected_sdk_auth_is_valid_and_its_secret_never_crosses_seam(
     with pytest.raises(AdapterDiagnostic) as caught:
         await failing_transport.connect()
     assert "direct-secret" not in caught.value.message
+
+
+@pytest.mark.parametrize(
+    "auth_factory",
+    [access_token_from_env, service_account_from_env],
+)
+async def test_custom_auth_environment_secret_never_crosses_seam(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    auth_factory: Callable[[str], AuthOptions],
+) -> None:
+    environment_name = "DOGQODER_CUSTOM_CREDENTIAL"
+    secret = "custom-environment-secret"
+    monkeypatch.setenv(environment_name, secret)
+    options = build_auditor_options(
+        tmp_path,
+        auth=auth_factory(environment_name),
+    )
+    transport = QoderSDKTransport(
+        FailingSDKClient(f"authentication failed for {secret}", options=options)
+    )
+
+    with pytest.raises(AdapterDiagnostic) as caught:
+        await transport.connect()
+
+    assert secret not in caught.value.message
+    assert caught.value.message == "authentication failed for [REDACTED]"
 
 
 async def test_sdk_messages_are_normalized_bounded_and_redacted(

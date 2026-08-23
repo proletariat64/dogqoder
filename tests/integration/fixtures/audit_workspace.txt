@@ -1,0 +1,1 @@
+This disposable audit fixture contains no credentials or executable content.

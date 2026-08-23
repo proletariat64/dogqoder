@@ -20,6 +20,7 @@ dev = [
 package = false
 
 [tool.pytest.ini_options]
+addopts = "-m 'not real_qoder'"
 asyncio_mode = "auto"
 markers = [
     "real_qoder: runs against the credentialed Qoder service",
