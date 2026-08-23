@@ -8,5 +8,27 @@ dependencies = [
     "qoder-agent-sdk==1.0.13",
 ]
 
+[dependency-groups]
+dev = [
+    "mypy",
+    "pytest",
+    "pytest-asyncio",
+    "ruff",
+]
+
 [tool.uv]
 package = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+markers = [
+    "real_qoder: runs against the credentialed Qoder service",
+]
+pythonpath = ["src"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+
+[tool.ruff]
+target-version = "py312"
