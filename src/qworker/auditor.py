@@ -152,11 +152,16 @@ def _render_prompt(contract: AuditContract) -> str:
         (
             "REPORT CONTRACT",
             (
-                "Return one JSON object with keys outcome, summary, files, "
-                "validation, and risks. outcome must be completed, partial, "
-                "or blocked. All fields except outcome and summary are arrays "
-                "of strings. Include severity, evidence, and affected requirement "
-                "or code location for every finding."
+                "Return exactly one JSON object with keys outcome, summary, files, "
+                "validation, risks, verdict, confirmed, findings, and "
+                "required_changes. outcome must be completed, partial, or blocked; "
+                "summary and verdict are strings; files, validation, risks, "
+                "confirmed, and required_changes are arrays of strings. findings "
+                "is an array of objects with exactly severity, evidence, and "
+                "affected_requirement_or_location; the first two are strings and "
+                "the last is a string or null. Use these audit destinations: "
+                "VERDICT -> verdict; CONFIRMED -> confirmed; FINDINGS -> findings; "
+                "RISKS -> risks; REQUIRED_CHANGES -> required_changes."
             ),
         ),
     )

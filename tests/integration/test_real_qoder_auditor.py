@@ -74,4 +74,5 @@ async def test_real_qwen_auditor_is_read_only(tmp_path: Path) -> None:
         pytest.fail("Qoder credential crossed the AuditResult boundary", pytrace=False)
     assert result.outcome == "completed", result
     assert result.resolved_model == "Qwen3.8-Max"
+    assert result.verdict is not None
     assert after == before

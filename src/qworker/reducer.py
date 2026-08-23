@@ -1,14 +1,16 @@
 """Reduce normalized transport events into one auditor result."""
 
 import json
+from dataclasses import dataclass
 from typing import Literal, TypeGuard, cast
 
-from qworker.domain import AuditResult
+from qworker.domain import AuditFinding, AuditResult
 from qworker.events import (
     AdapterEvent,
     AssistantEvent,
     ResultEvent,
     SemanticEvent,
+    SemanticEventKind,
     SystemEvent,
     TaskProgressEvent,
     TaskStartedEvent,
@@ -17,7 +19,34 @@ from qworker.events import (
 
 type AuditOutcome = Literal["completed", "partial", "blocked", "failed"]
 _REPORT_OUTCOMES = frozenset(("completed", "partial", "blocked"))
+_REPORT_KEYS = frozenset(
+    (
+        "outcome",
+        "summary",
+        "files",
+        "validation",
+        "risks",
+        "verdict",
+        "confirmed",
+        "findings",
+        "required_changes",
+    )
+)
+_FINDING_KEYS = frozenset(("severity", "evidence", "affected_requirement_or_location"))
 _MAX_SEMANTIC_EVENTS = 128
+
+
+@dataclass(frozen=True, slots=True)
+class _ParsedAuditReport:
+    outcome: AuditOutcome
+    summary: str
+    files: tuple[str, ...]
+    validation: tuple[str, ...]
+    risks: tuple[str, ...]
+    verdict: str
+    confirmed: tuple[str, ...]
+    findings: tuple[AuditFinding, ...]
+    required_changes: tuple[str, ...]
 
 
 class ResultReducer:
@@ -46,16 +75,22 @@ class ResultReducer:
     def apply(self, event: AdapterEvent) -> None:
         """Record one normalized event and update task-settlement state."""
 
-        self._record(event)
-        if isinstance(event, AssistantEvent):
-            self._record_model(event.model)
-        elif isinstance(event, TaskStartedEvent):
-            self._active_task_ids.add(event.task_id)
-        elif isinstance(event, TaskTerminalEvent):
-            self._active_task_ids.discard(event.task_id)
-        elif isinstance(event, ResultEvent):
-            self._result = event
-            for model in event.model_usage:
+        semantic_kinds = self._semantic_kinds(event)
+        self._record(semantic_kinds)
+        primary_kind = semantic_kinds[0]
+        if primary_kind == "assistant":
+            assistant_event = cast(AssistantEvent, event)
+            self._record_model(assistant_event.model)
+        elif primary_kind == "task_started":
+            task_started_event = cast(TaskStartedEvent, event)
+            self._active_task_ids.add(task_started_event.task_id)
+        elif primary_kind == "task_terminal":
+            task_terminal_event = cast(TaskTerminalEvent, event)
+            self._active_task_ids.discard(task_terminal_event.task_id)
+        elif primary_kind == "result":
+            result_event = cast(ResultEvent, event)
+            self._result = result_event
+            for model in result_event.model_usage:
                 self._record_model(model)
 
     def finish(self, settlement_expired: bool) -> AuditResult:
@@ -76,22 +111,31 @@ class ResultReducer:
                 errors=("result_missing",),
             )
 
-        target_outcome: AuditOutcome = (
-            "failed" if result_event.is_error else "completed"
-        )
         parsed_report = self._parse_report(result_event.result)
         warnings: list[str] = []
         if parsed_report is None:
-            outcome = target_outcome
+            outcome: AuditOutcome = "failed" if result_event.is_error else "partial"
             summary = result_event.result or ""
             files: tuple[str, ...] = ()
             validation: tuple[str, ...] = ()
             risks: tuple[str, ...] = ()
+            verdict: str | None = None
+            confirmed: tuple[str, ...] = ()
+            findings: tuple[AuditFinding, ...] = ()
+            required_changes: tuple[str, ...] = ()
             warnings.append("report_contract_unparseable")
         else:
-            outcome, summary, files, validation, risks = parsed_report
+            outcome = parsed_report.outcome
             if result_event.is_error:
                 outcome = "failed"
+            summary = parsed_report.summary
+            files = parsed_report.files
+            validation = parsed_report.validation
+            risks = parsed_report.risks
+            verdict = parsed_report.verdict
+            confirmed = parsed_report.confirmed
+            findings = parsed_report.findings
+            required_changes = parsed_report.required_changes
 
         nested_state = self._nested_state(settlement_expired)
         if nested_state == "unknown":
@@ -105,6 +149,10 @@ class ResultReducer:
             risks=risks,
             requested_model=self._requested_model,
             resolved_model=self._resolved_model,
+            verdict=verdict,
+            confirmed=confirmed,
+            findings=findings,
+            required_changes=required_changes,
             actual_models=tuple(self._actual_models),
             session_id=result_event.session_id,
             nested_state=nested_state,
@@ -112,24 +160,27 @@ class ResultReducer:
             errors=result_event.errors + result_event.permission_denials,
         )
 
-    def _record(self, event: AdapterEvent) -> None:
-        if len(self._semantic_events) == _MAX_SEMANTIC_EVENTS:
-            self._semantic_events.pop(0)
-        self._semantic_events.append(self._semantic_event(event))
+    def _record(self, semantic_kinds: tuple[SemanticEventKind, ...]) -> None:
+        for kind in semantic_kinds:
+            if len(self._semantic_events) == _MAX_SEMANTIC_EVENTS:
+                self._semantic_events.pop(0)
+            self._semantic_events.append(SemanticEvent(kind=kind))
 
     @staticmethod
-    def _semantic_event(event: AdapterEvent) -> SemanticEvent:
+    def _semantic_kinds(event: AdapterEvent) -> tuple[SemanticEventKind, ...]:
         if isinstance(event, AssistantEvent):
-            return SemanticEvent(kind="assistant")
+            semantic_kinds: list[SemanticEventKind] = ["assistant"]
+            semantic_kinds.extend("tool" for _ in event.tools)
+            return tuple(semantic_kinds)
         if isinstance(event, TaskStartedEvent):
-            return SemanticEvent(kind="task_started")
+            return ("task_started",)
         if isinstance(event, TaskProgressEvent):
-            return SemanticEvent(kind="task_progress")
+            return ("task_progress",)
         if isinstance(event, TaskTerminalEvent):
-            return SemanticEvent(kind="task_terminal")
+            return ("task_terminal",)
         if isinstance(event, SystemEvent):
-            return SemanticEvent(kind="system")
-        return SemanticEvent(kind="result")
+            return ("system",)
+        return ("result",)
 
     def _record_model(self, model: str | None) -> None:
         if model is not None and model not in self._actual_models:
@@ -144,19 +195,15 @@ class ResultReducer:
             return "settled"
         return "unknown" if settlement_expired else "active"
 
-    def _parse_report(
-        self, result_text: str | None
-    ) -> (
-        tuple[AuditOutcome, str, tuple[str, ...], tuple[str, ...], tuple[str, ...]]
-        | None
-    ):
+    def _parse_report(self, result_text: str | None) -> _ParsedAuditReport | None:
         if result_text is None:
             return None
+        normalized_text = self._normalize_report_json(result_text)
         try:
-            payload: object = json.loads(result_text)
+            payload: object = json.loads(normalized_text)
         except json.JSONDecodeError:
             return None
-        if not isinstance(payload, dict):
+        if not isinstance(payload, dict) or set(payload) != _REPORT_KEYS:
             return None
 
         outcome = payload.get("outcome")
@@ -164,6 +211,10 @@ class ResultReducer:
         files = payload.get("files")
         validation = payload.get("validation")
         risks = payload.get("risks")
+        verdict = payload.get("verdict")
+        confirmed = payload.get("confirmed")
+        findings = self._parse_findings(payload.get("findings"))
+        required_changes = payload.get("required_changes")
         if (
             not isinstance(outcome, str)
             or outcome not in _REPORT_OUTCOMES
@@ -171,16 +222,63 @@ class ResultReducer:
             or not self._is_string_list(files)
             or not self._is_string_list(validation)
             or not self._is_string_list(risks)
+            or not isinstance(verdict, str)
+            or not self._is_string_list(confirmed)
+            or findings is None
+            or not self._is_string_list(required_changes)
         ):
             return None
 
-        return (
-            cast(AuditOutcome, outcome),
-            summary,
-            tuple(files),
-            tuple(validation),
-            tuple(risks),
+        return _ParsedAuditReport(
+            outcome=cast(AuditOutcome, outcome),
+            summary=summary,
+            files=tuple(files),
+            validation=tuple(validation),
+            risks=tuple(risks),
+            verdict=verdict,
+            confirmed=tuple(confirmed),
+            findings=findings,
+            required_changes=tuple(required_changes),
         )
+
+    @staticmethod
+    def _normalize_report_json(result_text: str) -> str:
+        candidate = result_text.strip()
+        fence_prefix = "```json\n"
+        fence_suffix = "\n```"
+        if (
+            candidate.startswith(fence_prefix)
+            and candidate.endswith(fence_suffix)
+            and candidate.count("```") == 2
+        ):
+            return candidate[len(fence_prefix) : -len(fence_suffix)]
+        return result_text
+
+    @staticmethod
+    def _parse_findings(value: object) -> tuple[AuditFinding, ...] | None:
+        if not isinstance(value, list):
+            return None
+        findings: list[AuditFinding] = []
+        for item in value:
+            if not isinstance(item, dict) or set(item) != _FINDING_KEYS:
+                return None
+            severity = item.get("severity")
+            evidence = item.get("evidence")
+            affected = item.get("affected_requirement_or_location")
+            if (
+                not isinstance(severity, str)
+                or not isinstance(evidence, str)
+                or (affected is not None and not isinstance(affected, str))
+            ):
+                return None
+            findings.append(
+                AuditFinding(
+                    severity=severity,
+                    evidence=evidence,
+                    affected_requirement_or_location=affected,
+                )
+            )
+        return tuple(findings)
 
     @staticmethod
     def _is_string_list(value: object) -> TypeGuard[list[str]]:

@@ -53,8 +53,6 @@ from qworker.events import (
 )
 from qworker.model_policy import AvailableModel
 
-_VISIBLE_TOOLS = ["Read", "Glob", "Grep", "WebFetch", "WebSearch", "Agent"]
-_DISALLOWED_TOOLS = ["Write", "Edit", "Bash", "NotebookEdit"]
 _CREDENTIAL_ENV_VARS = (
     "QODER_PERSONAL_ACCESS_TOKEN",
     "QODER_SERVICE_ACCOUNT_KEY",
@@ -109,9 +107,9 @@ def build_auditor_options(
         auth=auth,
         cwd=cwd,
         setting_sources=[],
-        tools=list(_VISIBLE_TOOLS),
-        allowed_tools=list(_VISIBLE_TOOLS),
-        disallowed_tools=list(_DISALLOWED_TOOLS),
+        tools=list(policy.visible_tools),
+        allowed_tools=list(policy.visible_tools),
+        disallowed_tools=list(policy.denied_tools),
         permission_mode="dontAsk",
         max_turns=24,
         control_request_timeout_ms=30_000,

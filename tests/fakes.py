@@ -6,6 +6,13 @@ from collections.abc import AsyncIterator
 from qworker.events import AdapterEvent, ResultEvent
 from qworker.model_policy import AvailableModel
 
+SUCCESSFUL_AUDIT_REPORT = (
+    '{"outcome":"completed","summary":"safe","files":[],'
+    '"validation":[],"risks":[],"verdict":"approved",'
+    '"confirmed":["workspace inspected"],"findings":[],'
+    '"required_changes":[]}'
+)
+
 
 class FakeQoderTransport:
     """Deterministic transport recording foreground-auditor calls."""
@@ -34,10 +41,7 @@ class FakeQoderTransport:
                 ResultEvent(
                     session_id="session-1",
                     is_error=False,
-                    result=(
-                        '{"outcome":"completed","summary":"safe",'
-                        '"files":[],"validation":[],"risks":[]}'
-                    ),
+                    result=SUCCESSFUL_AUDIT_REPORT,
                     model_usage=(model,),
                 ),
             ),

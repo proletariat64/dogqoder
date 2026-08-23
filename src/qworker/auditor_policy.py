@@ -12,10 +12,8 @@ class PolicyDecision:
 class AuditorToolPolicy:
     """Allow only auditor-visible tools and fail closed for nested agent spawning."""
 
-    visible_tools = frozenset(
-        {"Read", "Glob", "Grep", "WebFetch", "WebSearch", "Agent"}
-    )
-    denied_tools = frozenset({"Write", "Edit", "Bash", "NotebookEdit"})
+    visible_tools = ("Read", "Glob", "Grep", "WebFetch", "WebSearch", "Agent")
+    denied_tools = ("Write", "Edit", "Bash", "NotebookEdit")
 
     def decide(self, tool_name: str, *, agent_id: str | None) -> PolicyDecision:
         allowed = tool_name in self.visible_tools and not (

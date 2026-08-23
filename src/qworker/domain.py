@@ -18,6 +18,15 @@ class AuditContract:
 
 
 @dataclass(frozen=True, slots=True)
+class AuditFinding:
+    """One evidenced auditor finding from the structured report contract."""
+
+    severity: str
+    evidence: str
+    affected_requirement_or_location: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class AuditResult:
     """Structured outcome from one foreground audit."""
 
@@ -28,6 +37,10 @@ class AuditResult:
     risks: tuple[str, ...]
     requested_model: str
     resolved_model: str | None
+    verdict: str | None = None
+    confirmed: tuple[str, ...] = ()
+    findings: tuple[AuditFinding, ...] = ()
+    required_changes: tuple[str, ...] = ()
     actual_models: tuple[str, ...] = ()
     session_id: str | None = None
     nested_state: Literal["none", "active", "settled", "unknown"] = "none"

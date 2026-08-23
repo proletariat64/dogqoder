@@ -60,6 +60,7 @@ class ResultEvent:
 
 type SemanticEventKind = Literal[
     "assistant",
+    "tool",
     "task_started",
     "task_progress",
     "task_terminal",

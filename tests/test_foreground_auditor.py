@@ -9,7 +9,7 @@ from qworker.domain import AuditContract
 from qworker.events import ResultEvent, TaskStartedEvent, TaskTerminalEvent
 from qworker.model_policy import AvailableModel
 from qworker.qoder_sdk import AdapterDiagnostic, QoderSDKTransport
-from tests.fakes import FakeQoderTransport
+from tests.fakes import SUCCESSFUL_AUDIT_REPORT, FakeQoderTransport
 
 
 async def test_foreground_auditor_returns_structured_completion(
@@ -83,10 +83,7 @@ async def test_completed_run_distinguishes_requested_resolved_and_actual_models(
                 is_error=False,
                 num_turns=1,
                 session_id="session-1",
-                result=(
-                    '{"outcome":"completed","summary":"safe","files":[],'
-                    '"validation":[],"risks":[]}'
-                ),
+                result=SUCCESSFUL_AUDIT_REPORT,
                 model_usage={"Qwen3.7-Max": usage},
             )
 
@@ -118,7 +115,11 @@ async def test_foreground_auditor_waits_for_delayed_terminal_task(
         models=(AvailableModel(value="Qwen3.8-Max", enabled=True),),
         events=(
             TaskStartedEvent(task_id="task-1", description="inspect design"),
-            ResultEvent(session_id="session-1", is_error=False, result="done"),
+            ResultEvent(
+                session_id="session-1",
+                is_error=False,
+                result=SUCCESSFUL_AUDIT_REPORT,
+            ),
             TaskTerminalEvent(task_id="task-1", status="completed"),
         ),
         event_delays=(0.0, 0.0, 0.001),
@@ -139,7 +140,11 @@ async def test_foreground_auditor_times_out_missing_terminal_task(
         models=(AvailableModel(value="Qwen3.8-Max", enabled=True),),
         events=(
             TaskStartedEvent(task_id="task-1", description="inspect design"),
-            ResultEvent(session_id="session-1", is_error=False, result="done"),
+            ResultEvent(
+                session_id="session-1",
+                is_error=False,
+                result=SUCCESSFUL_AUDIT_REPORT,
+            ),
         ),
         hang_after_events=True,
     )
@@ -185,6 +190,26 @@ async def test_foreground_auditor_renders_stable_prompt_envelope(
     assert "design.md is normative" in prompt
     assert "Report only evidenced findings." in prompt
     assert "Identify unsafe writes." in prompt
+    for destination in (
+        "VERDICT",
+        "CONFIRMED",
+        "FINDINGS",
+        "RISKS",
+        "REQUIRED_CHANGES",
+    ):
+        assert destination in prompt
+    for report_key in (
+        "outcome",
+        "summary",
+        "files",
+        "validation",
+        "risks",
+        "verdict",
+        "confirmed",
+        "findings",
+        "required_changes",
+    ):
+        assert report_key in prompt
     reasoning_prescriptions = (
         "chain of thought",
         "step-by-step reasoning",

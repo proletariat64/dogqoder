@@ -25,6 +25,7 @@ from qoder_agent_sdk import (
     service_account_from_env,
 )
 
+from qworker.auditor_policy import AuditorToolPolicy
 from qworker.events import (
     AssistantEvent,
     ResultEvent,
@@ -208,6 +209,20 @@ def test_auditor_options_are_layered_and_isolated(tmp_path: Path) -> None:
     assert options.cli_path is None
 
 
+def test_auditor_options_derive_tool_layers_from_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(AuditorToolPolicy, "visible_tools", ("Read", "Agent"))
+    monkeypatch.setattr(AuditorToolPolicy, "denied_tools", ("Write", "Bash"))
+
+    options = build_auditor_options(tmp_path)
+
+    assert options.tools == ["Read", "Agent"]
+    assert options.allowed_tools == ["Read", "Agent"]
+    assert options.disallowed_tools == ["Write", "Bash"]
+
+
 def test_invalid_raw_auth_shape_is_rejected(tmp_path: Path) -> None:
     invalid_auth = cast(
         AuthOptions,
@@ -294,6 +309,7 @@ async def test_sdk_messages_are_normalized_bounded_and_redacted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     secret = "secret-value"
+    tool_input_secret = "tool-input-secret-must-not-cross-seam"
     monkeypatch.setenv("QODER_PERSONAL_ACCESS_TOKEN", secret)
     usage = ModelUsage(
         inputTokens=1,
@@ -318,7 +334,11 @@ async def test_sdk_messages_are_normalized_bounded_and_redacted(
             AssistantMessage(
                 content=[
                     TextBlock(text=f"answer {secret}"),
-                    ToolUseBlock(id="tool-1", name="Read", input={}),
+                    ToolUseBlock(
+                        id="tool-1",
+                        name="Read",
+                        input={"file_path": tool_input_secret},
+                    ),
                 ],
                 model="Qwen3.8-Max",
             ),
@@ -380,6 +400,7 @@ async def test_sdk_messages_are_normalized_bounded_and_redacted(
 
     events = [event async for event in QoderSDKTransport(client).messages()]
 
+    assert tool_input_secret not in repr(events)
     assert events[:5] == [
         AssistantEvent(
             text=("answer [REDACTED]",),

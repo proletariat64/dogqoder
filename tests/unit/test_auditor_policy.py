@@ -18,3 +18,7 @@ def test_auditor_denies_mutating_and_unknown_tools(tool: str) -> None:
 
 def test_nested_auditor_cannot_spawn_another_agent() -> None:
     assert AuditorToolPolicy().decide("Agent", agent_id="nested-1").allowed is False
+
+
+def test_top_level_auditor_can_spawn_one_agent() -> None:
+    assert AuditorToolPolicy().decide("Agent", agent_id=None).allowed is True
