@@ -14,18 +14,21 @@ from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 
 from qoder_agent_sdk import (
+    AccessTokenAuthOptions,
     AssistantMessage,
     AuthAccessTokenEnvVarError,
     AuthNotConfiguredError,
+    AuthOptions,
     AuthServiceAccountEnvVarError,
     CLINotFoundError,
-    InternalAuthOptions,
     PermissionResultAllow,
     PermissionResultDeny,
     QoderAgentOptions,
+    QoderCLIAuthOptions,
     QoderSDKClient,
     ResultMessage,
     SDKPermissionDeniedMessage,
+    ServiceAccountAuthOptions,
     SystemMessage,
     TaskNotificationMessage,
     TaskProgressMessage,
@@ -78,9 +81,15 @@ class AdapterDiagnostic(RuntimeError):
 def build_auditor_options(
     cwd: str | Path,
     *,
-    auth: InternalAuthOptions | dict[str, Any] | None = None,
+    auth: AuthOptions | None = None,
 ) -> QoderAgentOptions:
     """Build isolated SDK options enforcing the auditor tool policy."""
+
+    if auth is not None and not isinstance(
+        auth,
+        (AccessTokenAuthOptions, QoderCLIAuthOptions, ServiceAccountAuthOptions),
+    ):
+        raise TypeError("Use a qoder_agent_sdk SDK auth helper.")
 
     policy = AuditorToolPolicy()
 
@@ -122,11 +131,27 @@ def create_default_transport(cwd: Path) -> "QoderSDKTransport":
     return QoderSDKTransport(QoderSDKClient(options=options))
 
 
-def classify_sdk_error(error: BaseException) -> AdapterDiagnostic:
+type SDKOperation = Literal[
+    "initialize",
+    "runtime_construction",
+    "model_discovery",
+    "model_selection",
+    "query",
+    "stream",
+    "disconnect",
+]
+
+
+def classify_sdk_error(
+    error: BaseException,
+    *,
+    operation: SDKOperation,
+    credential_values: tuple[str, ...] = (),
+) -> AdapterDiagnostic:
     """Classify an SDK failure without exposing credential values."""
 
     raw_message = str(error) or type(error).__name__
-    message = _bounded_text(_redact(raw_message))
+    message = _safe_bounded_text(raw_message, credential_values)
     if isinstance(error, AdapterDiagnostic):
         return AdapterDiagnostic(error.code, message)
     if isinstance(
@@ -138,13 +163,14 @@ def classify_sdk_error(error: BaseException) -> AdapterDiagnostic:
         ),
     ):
         return AdapterDiagnostic("auth_required", message)
-    if (
-        isinstance(error, TimeoutError)
-        or "control request timeout: initialize" in raw_message.casefold()
-    ):
-        return AdapterDiagnostic("initialize_timeout", message)
-    if isinstance(error, (CLINotFoundError, FileNotFoundError)):
-        return AdapterDiagnostic("runtime_not_found", message)
+    if operation in {"initialize", "runtime_construction"}:
+        if (
+            isinstance(error, TimeoutError)
+            or "control request timeout: initialize" in raw_message.casefold()
+        ):
+            return AdapterDiagnostic("initialize_timeout", message)
+        if isinstance(error, (CLINotFoundError, FileNotFoundError)):
+            return AdapterDiagnostic("runtime_not_found", message)
     return AdapterDiagnostic("sdk_protocol_error", message)
 
 
@@ -169,9 +195,14 @@ class QoderSDKTransport:
 
     def __init__(self, client: object) -> None:
         self._client = cast(_SDKClient, client)
+        self._credential_values = _direct_credential_values(client)
 
     async def connect(self) -> None:
-        await _call_sdk(lambda: self._client.connect(None))
+        await _call_sdk(
+            lambda: self._client.connect(None),
+            operation="initialize",
+            credential_values=self._credential_values,
+        )
 
     async def available_models(self) -> tuple[AvailableModel, ...]:
         async def load_catalog() -> tuple[AvailableModel, ...]:
@@ -181,113 +212,172 @@ class QoderSDKTransport:
                 value = item.get("value")
                 enabled = item.get("isEnabled")
                 if isinstance(value, str) and isinstance(enabled, bool):
-                    models.append(AvailableModel(value=_redact(value), enabled=enabled))
+                    models.append(
+                        AvailableModel(
+                            value=_redact(value, self._credential_values),
+                            enabled=enabled,
+                        )
+                    )
             return tuple(models)
 
-        return await _call_sdk(load_catalog)
+        return await _call_sdk(
+            load_catalog,
+            operation="model_discovery",
+            credential_values=self._credential_values,
+        )
 
     async def select_model(self, model: str) -> None:
-        await _call_sdk(lambda: self._client.set_model(model))
+        await _call_sdk(
+            lambda: self._client.set_model(model),
+            operation="model_selection",
+            credential_values=self._credential_values,
+        )
 
     async def send(self, prompt: str) -> None:
-        await _call_sdk(lambda: self._client.query(prompt))
+        await _call_sdk(
+            lambda: self._client.query(prompt),
+            operation="query",
+            credential_values=self._credential_values,
+        )
 
     async def messages(self) -> AsyncIterator[AdapterEvent]:
         try:
             async for message in self._client.receive_messages():
-                event = _map_sdk_message(message)
+                event = _map_sdk_message(message, self._credential_values)
                 if event is not None:
                     yield event
         # SDK 1.0.13 raises plain Exception for initialize control timeouts.
         except Exception as error:  # noqa: BLE001
-            diagnostic = classify_sdk_error(error)
+            diagnostic = classify_sdk_error(
+                error,
+                operation="stream",
+                credential_values=self._credential_values,
+            )
         else:
             return
         raise diagnostic
 
     async def disconnect(self) -> None:
-        await _call_sdk(self._client.disconnect)
+        await _call_sdk(
+            self._client.disconnect,
+            operation="disconnect",
+            credential_values=self._credential_values,
+        )
 
 
-async def _call_sdk[ResultT](operation: Callable[[], Awaitable[ResultT]]) -> ResultT:
+async def _call_sdk[ResultT](
+    call: Callable[[], Awaitable[ResultT]],
+    *,
+    operation: SDKOperation,
+    credential_values: tuple[str, ...],
+) -> ResultT:
     try:
-        return await operation()
+        return await call()
     # SDK 1.0.13 raises plain Exception for initialize control timeouts.
     except Exception as error:  # noqa: BLE001
-        diagnostic = classify_sdk_error(error)
+        diagnostic = classify_sdk_error(
+            error,
+            operation=operation,
+            credential_values=credential_values,
+        )
     raise diagnostic
 
 
-def _map_sdk_message(message: object) -> AdapterEvent | None:
+def _map_sdk_message(
+    message: object,
+    credential_values: tuple[str, ...],
+) -> AdapterEvent | None:
     if isinstance(message, AssistantMessage):
         return AssistantEvent(
             text=tuple(
-                _redact(block.text)
+                _redact(block.text, credential_values)
                 for block in message.content
                 if isinstance(block, TextBlock)
             ),
             tools=tuple(
-                _redact(block.name)
+                _redact(block.name, credential_values)
                 for block in message.content
                 if isinstance(block, ToolUseBlock)
             ),
-            model=_redact(message.model),
+            model=_redact(message.model, credential_values),
         )
     if isinstance(message, TaskStartedMessage):
         return TaskStartedEvent(
-            task_id=_redact(message.task_id),
-            description=_redact(message.description),
+            task_id=_redact(message.task_id, credential_values),
+            description=_redact(message.description, credential_values),
         )
     if isinstance(message, TaskProgressMessage):
         return TaskProgressEvent(
-            task_id=_redact(message.task_id),
-            description=_redact(message.description),
+            task_id=_redact(message.task_id, credential_values),
+            description=_redact(message.description, credential_values),
             last_tool_name=(
-                _redact(message.last_tool_name)
+                _redact(message.last_tool_name, credential_values)
                 if message.last_tool_name is not None
                 else None
             ),
         )
     if isinstance(message, TaskNotificationMessage):
         return TaskTerminalEvent(
-            task_id=_redact(message.task_id),
+            task_id=_redact(message.task_id, credential_values),
             status=message.status,
         )
     if isinstance(message, SDKPermissionDeniedMessage):
         return SystemEvent(
             subtype="permission_denied",
-            message=_permission_summary(message.tool_name, message.message),
+            message=_permission_summary(
+                message.tool_name,
+                message.message,
+                credential_values,
+            ),
         )
     if isinstance(message, SystemMessage):
         return SystemEvent(
-            subtype=_redact(message.subtype),
-            message=_bounded_diagnostic(message.data),
+            subtype=_safe_bounded_text(message.subtype, credential_values),
+            message=_bounded_diagnostic(message.data, credential_values),
         )
     if isinstance(message, ResultMessage):
         return ResultEvent(
-            session_id=_redact(message.session_id),
+            session_id=_redact(message.session_id, credential_values),
             is_error=message.is_error,
-            result=_redact(message.result) if message.result is not None else None,
-            model_usage=tuple(_redact(model) for model in (message.model_usage or {})),
+            result=(
+                _redact(message.result, credential_values)
+                if message.result is not None
+                else None
+            ),
+            model_usage=tuple(
+                _redact(model, credential_values)
+                for model in (message.model_usage or {})
+            ),
             permission_denials=tuple(
                 _permission_summary(
                     denial.get("tool_name", "unknown"),
                     denial.get("message", "denied"),
+                    credential_values,
                 )
                 for denial in (message.permission_denials or ())
             ),
-            errors=tuple(_redact(error) for error in (message.errors or ())),
+            errors=tuple(
+                _redact(error, credential_values) for error in (message.errors or ())
+            ),
         )
     return None
 
 
-def _permission_summary(tool_name: str, message: str) -> str:
-    return _redact(f"{tool_name}: {message}")
+def _permission_summary(
+    tool_name: str,
+    message: str,
+    credential_values: tuple[str, ...],
+) -> str:
+    return _safe_bounded_text(f"{tool_name}: {message}", credential_values)
 
 
-def _bounded_diagnostic(data: object) -> str:
+def _bounded_diagnostic(data: object, credential_values: tuple[str, ...]) -> str:
     rendered = json.dumps(data, ensure_ascii=False, sort_keys=True, default=repr)
-    return _bounded_text(_redact(rendered))
+    return _safe_bounded_text(rendered, credential_values)
+
+
+def _safe_bounded_text(value: str, credential_values: tuple[str, ...]) -> str:
+    return _bounded_text(_redact(value, credential_values))
 
 
 def _bounded_text(safe: str) -> str:
@@ -296,10 +386,33 @@ def _bounded_text(safe: str) -> str:
     return safe[: _MAX_SYSTEM_DIAGNOSTIC_CHARS - 3] + "..."
 
 
-def _redact(value: str) -> str:
+def _redact(value: str, credential_values: tuple[str, ...] = ()) -> str:
     safe = value
+    for direct_secret in credential_values:
+        if direct_secret:
+            safe = safe.replace(direct_secret, "[REDACTED]")
     for variable in _CREDENTIAL_ENV_VARS:
-        secret = os.environ.get(variable)
-        if secret:
-            safe = safe.replace(secret, "[REDACTED]")
+        environment_secret = os.environ.get(variable)
+        if environment_secret:
+            safe = safe.replace(environment_secret, "[REDACTED]")
     return safe
+
+
+def _direct_credential_values(client: object) -> tuple[str, ...]:
+    options = getattr(client, "options", None)
+    if not isinstance(options, QoderAgentOptions):
+        return ()
+    auth = options.auth
+    if (
+        isinstance(auth, AccessTokenAuthOptions)
+        and isinstance(auth.access_token, str)
+        and auth.access_token
+    ):
+        return (auth.access_token,)
+    if (
+        isinstance(auth, ServiceAccountAuthOptions)
+        and isinstance(auth.service_account_key, str)
+        and auth.service_account_key
+    ):
+        return (auth.service_account_key,)
+    return ()

@@ -5,6 +5,7 @@ from qoder_agent_sdk import CLINotFoundError
 
 from qworker.qoder_sdk import (
     AdapterDiagnostic,
+    SDKOperation,
     classify_sdk_error,
     create_default_transport,
 )
@@ -25,19 +26,28 @@ def test_missing_token_raises_actionable_secret_free_diagnostic(
 
 
 @pytest.mark.parametrize(
-    ("error", "expected_code"),
+    ("error", "operation", "expected_code"),
     [
-        (TimeoutError("initialize timed out"), "initialize_timeout"),
-        (RuntimeError("Control request timeout: initialize"), "initialize_timeout"),
-        (CLINotFoundError("missing runtime"), "runtime_not_found"),
-        (RuntimeError("malformed SDK response"), "sdk_protocol_error"),
+        (TimeoutError("initialize timed out"), "initialize", "initialize_timeout"),
+        (
+            RuntimeError("Control request timeout: initialize"),
+            "initialize",
+            "initialize_timeout",
+        ),
+        (CLINotFoundError("missing runtime"), "initialize", "runtime_not_found"),
+        (FileNotFoundError("missing runtime"), "initialize", "runtime_not_found"),
+        (TimeoutError("model timeout"), "model_discovery", "sdk_protocol_error"),
+        (CLINotFoundError("late failure"), "query", "sdk_protocol_error"),
+        (FileNotFoundError("late failure"), "disconnect", "sdk_protocol_error"),
+        (RuntimeError("malformed SDK response"), "stream", "sdk_protocol_error"),
     ],
 )
 def test_sdk_errors_are_classified(
     error: Exception,
+    operation: SDKOperation,
     expected_code: str,
 ) -> None:
-    assert classify_sdk_error(error).code == expected_code
+    assert classify_sdk_error(error, operation=operation).code == expected_code
 
 
 def test_error_redaction_removes_known_secret(
@@ -45,7 +55,10 @@ def test_error_redaction_removes_known_secret(
 ) -> None:
     monkeypatch.setenv("QODER_PERSONAL_ACCESS_TOKEN", "secret-value")
 
-    diagnostic = classify_sdk_error(RuntimeError("secret-value failed"))
+    diagnostic = classify_sdk_error(
+        RuntimeError("secret-value failed"),
+        operation="query",
+    )
 
     assert "secret-value" not in diagnostic.message
     assert diagnostic.message == "[REDACTED] failed"
