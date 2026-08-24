@@ -29,9 +29,7 @@ _MAX_FRAME_BYTES = 4 * 1024 * 1024
 _MAX_REQUEST_ID_CHARS = 128
 _MAX_ENCODED_REQUEST_ID_BYTES = _MAX_REQUEST_ID_CHARS * 12 + 2
 _TERMINAL_STATES = frozenset(("completed", "failed", "cancelled", "lost"))
-_REQUEST_ID_PATTERN = re.compile(
-    rb'"request_id"\s*:\s*("(?:\\.|[^"\\])*")'
-)
+_REQUEST_ID_PATTERN = re.compile(rb'"request_id"\s*:\s*("(?:\\.|[^"\\])*")')
 
 
 class _FrameTooLargeError(Exception):
@@ -96,7 +94,10 @@ class RPCServer:
             current = self._socket_path.lstat()
         except FileNotFoundError:
             return
-        if stat.S_ISSOCK(current.st_mode) and (current.st_dev, current.st_ino) == identity:
+        if (
+            stat.S_ISSOCK(current.st_mode)
+            and (current.st_dev, current.st_ino) == identity
+        ):
             self._socket_path.unlink()
 
     async def serve_forever(self) -> None:
@@ -144,7 +145,9 @@ class RPCServer:
                     await _write_frame(
                         writer,
                         _failure(
-                            error.request_id if error.request_id is not None else request_id,
+                            error.request_id
+                            if error.request_id is not None
+                            else request_id,
                             "frame_too_large",
                             _frame_limit_message(),
                         ),
@@ -210,9 +213,7 @@ class RPCServer:
             priority = _optional_string(params, "priority", default="next")
             if priority not in ("now", "next", "later"):
                 raise ValueError("priority must be now, next, or later.")
-            agent_id = (
-                _string(params, "agent_id") if "agent_id" in params else None
-            )
+            agent_id = _string(params, "agent_id") if "agent_id" in params else None
             return await self._supervisor.steer(
                 _string(params, "worker_id"),
                 _string(params, "message"),
@@ -441,9 +442,7 @@ async def _open_connection(
     socket_path: Path,
 ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
     try:
-        return await asyncio.open_unix_connection(
-            socket_path, limit=_MAX_FRAME_BYTES
-        )
+        return await asyncio.open_unix_connection(socket_path, limit=_MAX_FRAME_BYTES)
     except OSError:
         raise RPCClientError(
             "supervisor_unavailable", "qworker supervisor is unavailable."

@@ -234,9 +234,7 @@ def _table(
     label: str,
 ) -> Mapping[str, object]:
     value = data.get(name, {})
-    if not isinstance(value, dict) or not all(
-        isinstance(key, str) for key in value
-    ):
+    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
         raise ConfigError(f"{label} [{name}] must be a table.")
     return cast(dict[str, object], value)
 

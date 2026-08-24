@@ -82,9 +82,7 @@ class DoctorResult:
                 else None
             ),
             "auth": (
-                {"source": self.auth_source}
-                if self.auth_source is not None
-                else None
+                {"source": self.auth_source} if self.auth_source is not None else None
             ),
             "capabilities": list(self.capabilities),
             "warnings": list(self.warnings),
@@ -185,10 +183,7 @@ class RuntimePreflight:
         except PreflightFailure as error:
             diagnostic = safe_preflight_failure(error.code)
             warnings: tuple[PreflightWarningCode, ...] = ()
-            if (
-                auth.source == "qodercli"
-                and diagnostic.code == "initialize_timeout"
-            ):
+            if auth.source == "qodercli" and diagnostic.code == "initialize_timeout":
                 try:
                     status_ok = await self._backend.local_login_status(runtime)
                 except Exception:  # noqa: BLE001 -- status output is never exposed

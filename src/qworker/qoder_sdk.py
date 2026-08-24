@@ -211,7 +211,9 @@ def build_configured_auditor_options(
             "runtime_incompatible",
         }:
             raise AdapterDiagnostic("sdk_protocol_error", error.message) from None
-        raise AdapterDiagnostic(cast(AdapterDiagnosticCode, error.code), error.message) from None
+        raise AdapterDiagnostic(
+            cast(AdapterDiagnosticCode, error.code), error.message
+        ) from None
     return build_auditor_options(
         cwd,
         auth=_sdk_auth(auth),
@@ -349,9 +351,7 @@ class QoderPreflightBackend:
 
     async def local_login_status(self, runtime: RuntimeInfo) -> bool:
         try:
-            result = await self._command_runner(
-                (str(runtime.executable), "status")
-            )
+            result = await self._command_runner((str(runtime.executable), "status"))
         except Exception:  # noqa: BLE001 -- command output is deliberately discarded
             return False
         return result.returncode == 0
@@ -714,7 +714,10 @@ def _sdk_subprocess_transport(
     """Locate SDK 1.0.13 transport after or during query construction."""
 
     query = getattr(client, "_query", None)
-    candidates = (getattr(query, "transport", None), getattr(client, "_transport", None))
+    candidates = (
+        getattr(query, "transport", None),
+        getattr(client, "_transport", None),
+    )
     seen: set[int] = set()
     for transport in candidates:
         if transport is None or id(transport) in seen:

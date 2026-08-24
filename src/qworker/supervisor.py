@@ -137,7 +137,8 @@ class Supervisor:
                 )
             if preflight.sdk_version is None or preflight.runtime_path is None:
                 raise SupervisorError(
-                    "sdk_protocol_error", "Qoder preflight returned incomplete metadata."
+                    "sdk_protocol_error",
+                    "Qoder preflight returned incomplete metadata.",
                 )
             sdk_version = preflight.sdk_version
             runtime_path = preflight.runtime_path
@@ -274,7 +275,9 @@ class Supervisor:
         """Deliver one UUID-stamped message to a live top-level worker."""
 
         if not message:
-            raise SupervisorError("invalid_request", "Steering message must not be empty.")
+            raise SupervisorError(
+                "invalid_request", "Steering message must not be empty."
+            )
         if priority not in _STEERING_PRIORITIES:
             raise SupervisorError("invalid_request", "Unknown steering priority.")
         if agent_id is not None:
@@ -683,17 +686,13 @@ class Supervisor:
             async def request_permission(
                 request: PermissionRequest,
             ) -> PermissionDecision:
-                decision = await self._request_approval(
-                    worker_id, attempt, request
-                )
+                decision = await self._request_approval(worker_id, attempt, request)
                 return cast(PermissionDecision, decision)
 
             async def request_elicitation(
                 request: ElicitationRequest,
             ) -> ElicitationDecision:
-                decision = await self._request_approval(
-                    worker_id, attempt, request
-                )
+                decision = await self._request_approval(worker_id, attempt, request)
                 return cast(ElicitationDecision, decision)
 
             transport.bind_control(
@@ -733,9 +732,7 @@ class Supervisor:
             result = await auditor.run(contract)
         except asyncio.CancelledError:
             missing_state: Literal["cancelled", "lost"] = (
-                "cancelled"
-                if (worker_id, attempt) in self._stop_requests
-                else "lost"
+                "cancelled" if (worker_id, attempt) in self._stop_requests else "lost"
             )
             await self._finalize_without_result(
                 worker_id,
@@ -745,9 +742,7 @@ class Supervisor:
             raise
         except (BrokenPipeError, ConnectionResetError, EOFError):
             missing_state = (
-                "cancelled"
-                if (worker_id, attempt) in self._stop_requests
-                else "lost"
+                "cancelled" if (worker_id, attempt) in self._stop_requests else "lost"
             )
             await self._finalize_without_result(
                 worker_id,
@@ -760,9 +755,7 @@ class Supervisor:
 
         if "result_missing" in result.errors:
             missing_state = (
-                "cancelled"
-                if (worker_id, attempt) in self._stop_requests
-                else "lost"
+                "cancelled" if (worker_id, attempt) in self._stop_requests else "lost"
             )
             await self._finalize_without_result(
                 worker_id,
@@ -1135,9 +1128,7 @@ def _validated_message_id(message_id: str) -> None:
             "invalid_request", "message_id must be a canonical UUID."
         ) from None
     if str(parsed) != message_id:
-        raise SupervisorError(
-            "invalid_request", "message_id must be a canonical UUID."
-        )
+        raise SupervisorError("invalid_request", "message_id must be a canonical UUID.")
 
 
 def _approval_status(decision: ApprovalDecision) -> str:

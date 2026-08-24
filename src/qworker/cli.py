@@ -237,9 +237,7 @@ def _parser() -> _ArgumentParser:
 
     steer = commands.add_parser("steer")
     steer.add_argument("worker_id")
-    steer.add_argument(
-        "--priority", choices=("now", "next", "later"), default="next"
-    )
+    steer.add_argument("--priority", choices=("now", "next", "later"), default="next")
     steer.add_argument("--message-file", type=Path)
     steer.add_argument("--agent-id")
     steer.add_argument("--json", action="store_true")
@@ -322,14 +320,10 @@ async def _spawn(
             if error.code != "supervisor_unavailable":
                 raise
         await asyncio.sleep(0.05)
-    raise RPCClientError(
-        "supervisor_unavailable", "qworker supervisor is unavailable."
-    )
+    raise RPCClientError("supervisor_unavailable", "qworker supervisor is unavailable.")
 
 
-def _launch_supervisor(
-    socket_path: Path, state_dir: Path
-) -> subprocess.Popen[bytes]:
+def _launch_supervisor(socket_path: Path, state_dir: Path) -> subprocess.Popen[bytes]:
     return subprocess.Popen(
         (
             sys.executable,

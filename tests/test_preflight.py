@@ -283,7 +283,7 @@ async def test_authentication_selection_has_fixed_priority(
         (
             (
                 '[runtime]\npath = "/opt/qoder/qodercli"\n'
-                '[auth]\nreuse_qodercli = true\n'
+                "[auth]\nreuse_qodercli = true\n"
             ),
             "/opt/qoder/qodercli",
             "1.2.7",
@@ -402,9 +402,7 @@ async def test_local_login_initialize_timeout_is_redacted_and_actionable(
     def client_factory(options: QoderAgentOptions) -> object:
         client = FakeControlClient(
             options,
-            connect_error=RuntimeError(
-                f"Control request timeout: initialize {secret}"
-            ),
+            connect_error=RuntimeError(f"Control request timeout: initialize {secret}"),
         )
         clients.append(client)
         return client
