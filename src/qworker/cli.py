@@ -51,10 +51,14 @@ async def run(
             return 0 if doctor_result.ok else 1
         if arguments.command == "spawn":
             objective = _read_objective(arguments.spec_file, stdin)
+            role = cast(str, arguments.role)
+            model = cast(str | None, arguments.model)
+            if model is None:
+                model = "qwen-coder" if role == "coder" else "qwen-auditor"
             params: dict[str, JsonValue] = {
-                "role": cast(str, arguments.role),
+                "role": role,
                 "cwd": str(cast(Path, arguments.cwd)),
-                "model": cast(str, arguments.model),
+                "model": model,
                 "objective": objective,
             }
             result = await _spawn(
@@ -210,9 +214,9 @@ def _parser() -> _ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     spawn = commands.add_parser("spawn")
-    spawn.add_argument("--role", required=True, choices=("auditor",))
+    spawn.add_argument("--role", required=True, choices=("auditor", "coder"))
     spawn.add_argument("--cwd", required=True, type=Path)
-    spawn.add_argument("--model", default="qwen-auditor")
+    spawn.add_argument("--model")
     spawn.add_argument("--spec-file", type=Path)
     spawn.add_argument("--no-start-supervisor", action="store_true")
     spawn.add_argument("--json", action="store_true")

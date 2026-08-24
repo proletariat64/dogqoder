@@ -103,6 +103,70 @@ async def test_spawn_returns_stable_id_before_durable_completion(
     await reopened.close()
 
 
+async def test_rpc_constructs_coder_contract_and_rejects_missing_cwd(
+    tmp_path: Path,
+) -> None:
+    gate = asyncio.Event()
+    supervisor = Supervisor(
+        WorkerStore(tmp_path / "state"),
+        lambda _: GatedFakeQoderTransport(
+            asyncio.Event(), session_id="unexpected-auditor"
+        ),
+        coder_transport_factory=lambda _: GatedFakeQoderTransport(
+            gate, session_id="coder-rpc"
+        ),
+        sdk_version="1.0.13",
+    )
+    socket_path = tmp_path / "runtime" / "qworker.sock"
+    server = RPCServer(supervisor, socket_path)
+    await server.start()
+    reader, writer = await asyncio.open_unix_connection(socket_path)
+
+    await _write_request(
+        writer,
+        {
+            "request_id": "spawn-coder",
+            "method": "spawn",
+            "params": {
+                "role": "coder",
+                "cwd": str(tmp_path),
+                "objective": "implement through rpc",
+            },
+        },
+    )
+    response = await _read_response(reader)
+    assert response["ok"] is True
+    accepted = response["result"]
+    assert isinstance(accepted, dict)
+    assert accepted["role"] == "coder"
+    status = await supervisor.status(str(accepted["worker_id"]))
+    assert status["requested_model"] == "qwen-coder"
+    assert status["write_capability"] == "shared_workspace"
+
+    await _write_request(
+        writer,
+        {
+            "request_id": "spawn-coder-missing-cwd",
+            "method": "spawn",
+            "params": {
+                "role": "coder",
+                "cwd": str(tmp_path / "missing"),
+                "objective": "must reject",
+            },
+        },
+    )
+    rejected = await _read_response(reader)
+    assert rejected["ok"] is False
+    error = rejected["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == "invalid_request"
+
+    writer.close()
+    await writer.wait_closed()
+    await server.close()
+    await supervisor.close()
+
+
 async def _write_request(
     writer: asyncio.StreamWriter, request: dict[str, object]
 ) -> None:

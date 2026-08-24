@@ -14,6 +14,7 @@ from importlib.metadata import version
 from pathlib import Path
 from typing import cast
 
+from qworker.coder import CoderContract
 from qworker.control import SteeringPriority
 from qworker.domain import AuditContract
 from qworker.preflight import (
@@ -182,18 +183,35 @@ class RPCServer:
                 ),
             )
             role = _string(params, "role")
-            if role != "auditor":
-                raise ValueError("Task 6 supports role 'auditor'.")
-            contract = AuditContract(
-                objective=_string(params, "objective"),
-                cwd=Path(_string(params, "cwd")),
-                requested_model=_optional_string(
-                    params, "model", default="qwen-auditor"
-                ),
-                context=_string_tuple(params, "context"),
-                constraints=_string_tuple(params, "constraints"),
-                acceptance_criteria=_string_tuple(params, "acceptance_criteria"),
-            )
+            if role not in ("auditor", "coder"):
+                raise ValueError("role must be auditor or coder.")
+            objective = _string(params, "objective")
+            cwd = Path(_string(params, "cwd"))
+            context = _string_tuple(params, "context")
+            constraints = _string_tuple(params, "constraints")
+            acceptance_criteria = _string_tuple(params, "acceptance_criteria")
+            if role == "coder":
+                contract: AuditContract | CoderContract = CoderContract(
+                    objective=objective,
+                    cwd=cwd,
+                    requested_model=_optional_string(
+                        params, "model", default="qwen-coder"
+                    ),
+                    context=context,
+                    constraints=constraints,
+                    acceptance_criteria=acceptance_criteria,
+                )
+            else:
+                contract = AuditContract(
+                    objective=objective,
+                    cwd=cwd,
+                    requested_model=_optional_string(
+                        params, "model", default="qwen-auditor"
+                    ),
+                    context=context,
+                    constraints=constraints,
+                    acceptance_criteria=acceptance_criteria,
+                )
             return await self._supervisor.spawn(contract)
         if method == "status":
             _validate_fields(params, required=("worker_id",))
@@ -710,6 +728,7 @@ async def run_server(socket_path: Path, state_dir: Path) -> None:
     from qworker.preflight import RuntimePreflight
     from qworker.qoder_sdk import (
         QoderPreflightBackend,
+        create_coder_transport,
         create_default_transport,
         create_resumed_transport,
     )
@@ -722,6 +741,7 @@ async def run_server(socket_path: Path, state_dir: Path) -> None:
         sdk_version=version("qoder-agent-sdk"),
         preflight=preflight.run,
         resume_transport_factory=create_resumed_transport,
+        coder_transport_factory=create_coder_transport,
     )
     server = RPCServer(supervisor, socket_path)
     stopped = asyncio.Event()

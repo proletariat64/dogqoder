@@ -130,6 +130,69 @@ async def test_json_spawn_exits_zero_on_acceptance_without_claiming_completion(
     await supervisor.close()
 
 
+async def test_json_coder_spawn_uses_role_default_and_reports_overlap(
+    tmp_path: Path,
+) -> None:
+    gates = (asyncio.Event(), asyncio.Event())
+    transports = iter(
+        (
+            GatedFakeQoderTransport(gates[0], session_id="coder-cli-1"),
+            GatedFakeQoderTransport(gates[1], session_id="coder-cli-2"),
+        )
+    )
+    supervisor = Supervisor(
+        WorkerStore(tmp_path / "state"),
+        lambda _: GatedFakeQoderTransport(
+            asyncio.Event(), session_id="unexpected-auditor"
+        ),
+        coder_transport_factory=lambda _: next(transports),
+        sdk_version="1.0.13",
+    )
+    socket_path = tmp_path / "runtime" / "qworker.sock"
+    server = RPCServer(supervisor, socket_path)
+    await server.start()
+
+    async def spawn(objective: str) -> dict[str, object]:
+        stdout = StringIO()
+        exit_code = await run(
+            [
+                "--socket",
+                str(socket_path),
+                "spawn",
+                "--role",
+                "coder",
+                "--cwd",
+                str(tmp_path),
+                "--json",
+            ],
+            stdin=StringIO(objective),
+            stdout=stdout,
+        )
+        assert exit_code == 0
+        result = json.loads(stdout.getvalue())
+        assert isinstance(result, dict)
+        return result
+
+    first = await spawn("first coder")
+    second = await spawn("second coder")
+
+    assert first["role"] == "coder"
+    assert second["role"] == "coder"
+    assert second["warnings"] == [
+        {
+            "code": "shared_workspace_overlap",
+            "worker_id": first["worker_id"],
+            "cwd": str(tmp_path),
+            "relation": "same",
+        }
+    ]
+    status = await supervisor.status(str(first["worker_id"]))
+    assert status["requested_model"] == "qwen-coder"
+
+    await server.close()
+    await supervisor.close()
+
+
 async def test_qworker_console_entrypoint_emits_json_connection_error(
     tmp_path: Path,
 ) -> None:
