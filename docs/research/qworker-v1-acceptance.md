@@ -6,8 +6,9 @@ Date: 2026-08-24
 
 V1 is **not yet fully accepted**. Credential-free public-interface coverage now
 demonstrates most lifecycle, control, persistence, recovery, and security
-contracts. The three authorized one-shot closing markers produced useful but
-non-passing evidence for criteria 5, 6, and 11, so those criteria remain partial.
+contracts. The three authorized one-shot closing markers, plus one later
+diagnosis-driven AC5 rerun, produced useful but non-passing evidence for criteria
+5, 6, and 11, so those criteria remain partial.
 Acceptance criterion 7 is **Waived — QoderCLI limitation** by explicit user
 decision; a waiver records the unsupported boundary and is not a demonstration.
 
@@ -56,7 +57,7 @@ Status meanings:
 | 2 | Demonstrated | Same test uses fresh CLI processes for `status`, `watch`, `steer`, `cancel-message`, `respond`, and `result` while one supervisor owns both attempts. |
 | 3 | Demonstrated | Same test replays from zero, reconnects with the last cursor, follows to terminal state, and asserts contiguous per-worker sequences without cross-worker events. |
 | 4 | Live-confirmed | The deterministic lifecycle test proves requested `qwen-auditor`, resolved `Qwen3.8-Max`, and actual `Qwen3.8-Max` fields at the public result boundary. The authorized live rerun confirmed accepted/starting/running/result/completed lifecycle, no requires-action/lost/failed state, bundled runtime selection, and resolved plus actual `Qwen3.8-Max` reporting. |
-| 5 | Partial | `test_public_coder_edits_disposable_workspace_without_leaking_credentials` demonstrates the public coder contract deterministically. The one authorized real marker created the exact requested file in a disposable non-worktree and reported resolved/actual `Qwen3.8-Max`, but its terminal result was not `completed` and contained neither the required file report nor a nonempty validation list. |
+| 5 | Partial | Public deterministic coverage now recovers an exact five-key report from the latest assistant event when the terminal SDK result is unparseable. Both the initial marker and the one explicitly authorized post-fix rerun created the exact requested file in a disposable non-worktree and reported resolved/actual `Qwen3.8-Max`; both still lacked completed outcome, file report, and nonempty validation. The fallback therefore did not close the live criterion. |
 | 6 | Partial | Deterministic callback tests deny top-level and nested Write/Edit/Bash requests and prove the safe probe discards inputs and agent IDs. In the one authorized adversarial live marker, the workspace remained byte-identical and credential-free, but QoderCLI emitted none of the requested top-level or helper permission callbacks, including no top-level Agent request, and the structured result did not complete. The live denial boundary is therefore unproven. |
 | 7 | Waived — QoderCLI limitation | Adapter fixtures can normalize task messages, but the installed live QoderCLI/SDK path did not provide a trustworthy public correlation from worker task telemetry to post-run direct-helper discovery. The SDK's transcript readers are standalone local functions keyed by a session UUID; qworker's public result intentionally does not expose that locator or persist direct-helper task events. Context7 returned cloud-session material rather than a supported local worker correlation flow. The user explicitly waived AC7; it is not accepted as demonstrated. |
 | 8 | Demonstrated | The lifecycle test emits task start/progress without terminal telemetry. Both public results finish with `nested_state=unknown` and warning `nested_terminal_event_missing`; neither worker stays running. |
@@ -85,16 +86,19 @@ runs passed; the final run was:
 uv run pytest tests/test_supervisor_rpc.py::test_rpc_over_limit_request_with_near_limit_id_stays_structured -q
 # 1 passed in 0.73s
 
+uv run pytest tests/test_coder.py tests/integration/test_real_auditor_security.py -m 'not real_qoder' -q
+# 8 passed, 3 deselected in 3.08s
+
 uv run pytest -q
-# 262 passed, 7 deselected in 21.57s
+# 263 passed, 7 deselected in 23.25s
 
 uv run ruff format --check src tests
 # Failed: 7 shared files outside Task 14 scope would be reformatted
 
-uv run ruff format --check tests/integration/test_real_worker_lifecycle.py tests/integration/test_real_auditor_security.py tests/integration/test_real_resume.py
-# 3 files already formatted
+uv run ruff format --check src/qworker/coder.py tests/integration/test_real_worker_lifecycle.py tests/integration/test_real_auditor_security.py tests/integration/test_real_resume.py
+# 4 files already formatted
 
-uv run ruff check tests/integration/test_real_auditor_security.py tests/integration/test_real_resume.py
+uv run ruff check src tests
 # All checks passed
 
 uv run mypy src tests
@@ -111,7 +115,9 @@ Only the specifically authorized Task 14 marker nodes ran. Existing
 pytest disposable directory, sent its objective over stdin, captured child
 stdout/stderr, applied per-process plus 190-second in-test and 210-second outer
 timeouts, and emitted no token, session ID, prompt, marker, transcript, or model
-response. The AC5/AC6/AC11 nodes ran serially exactly once each with no retry.
+response. The initial AC5/AC6/AC11 nodes ran serially exactly once each. A later
+AC5-only diagnosis phase received separate explicit authorization for exactly
+one post-fix rerun; AC6, AC11, and all other real nodes remained excluded.
 
 Initial one-shot diagnostic:
 
@@ -183,7 +189,41 @@ no `.git` directory `true`, resolved model `Qwen3.8-Max` `true`, actual model
 `Qwen3.8-Max` `true`, and credential exclusion `true`; completed result,
 reported `marker.txt`, and nonempty structured validation were all `false`.
 The coder therefore demonstrated a real edit but not the required validation
-report. The node was not retried.
+report. The node was not retried under that authorization.
+
+### AC5 diagnosis, fix, and authorized post-fix rerun
+
+A credential-free public-boundary replay reproduced the exact split: the coder
+applied its edit and emitted an exact report in an assistant event, but an empty
+terminal SDK result reduced to partial with empty files and validation. Before
+the fix, the minimized command failed deterministically; after commit `d0b9bd7`
+(`fix: recover coder report contract`), the same command passed:
+
+```bash
+uv run pytest tests/integration/test_real_auditor_security.py::test_ac5_replay_requires_contract_after_successful_coder_edit -q
+# pre-fix: 1 failed in 1.65s
+# post-fix: 1 passed in 1.60s
+```
+
+The minimal fix keeps a valid terminal result authoritative and otherwise uses
+the newest assistant text that independently satisfies the unchanged exact
+five-key coder contract. It does not accept fenced JSON, extra keys, or a
+missing contract.
+
+The user then authorized exactly one bounded AC5-only real marker from the
+committed fix. It ran once and was not retried:
+
+```bash
+timeout 210s uv run pytest -m real_qoder tests/integration/test_real_auditor_security.py::test_real_coder_edit_and_structured_validation_ac5 -q
+# 1 failed in 30.71s
+```
+
+The fixed-boolean signature was unchanged: exact marker file, no worktree,
+resolved/actual `Qwen3.8-Max`, and credential exclusion were `true`; completed
+result, reported marker file, and nonempty validation were `false`. This safely
+rules out “exact contract existed in a prior assistant event” for this run; it
+does not reveal or retain the prompt, marker, session, transcript, or response.
+No AC6, AC11, earlier UAT, or other real test ran in this diagnosis phase.
 
 ```bash
 timeout 210s uv run pytest -m real_qoder tests/integration/test_real_auditor_security.py::test_real_auditor_and_direct_helper_denials_ac6 -q
@@ -212,9 +252,9 @@ retried.
 
 ## Remaining acceptance work
 
-1. Determine why the real coder completes its exact edit without returning the
-   required structured file/validation report; a future live retry needs fresh
-   explicit authorization.
+1. Determine why the real coder completes its exact edit without placing an
+   exact contract in either the terminal result or assistant-event fallback; a
+   future live retry needs fresh explicit authorization.
 2. Determine why the installed QoderCLI does not issue the exposed adversarial
    Write/Edit/Bash or Agent callbacks; a future live retry needs fresh explicit
    authorization.
