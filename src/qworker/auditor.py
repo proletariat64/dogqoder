@@ -1,7 +1,7 @@
 """Foreground orchestration for one read-only Qoder audit."""
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from pathlib import Path
 
@@ -17,6 +17,7 @@ from qworker.reducer import ResultReducer
 from qworker.transport import QoderTransport
 
 type TransportFactory = Callable[[Path], QoderTransport]
+type InitializationObserver = Callable[[str], Awaitable[None]]
 
 _DEFAULT_SETTLEMENT_TIMEOUT = 5.0
 
@@ -29,9 +30,11 @@ class ForegroundAuditor:
         transport_factory: TransportFactory,
         *,
         settlement_timeout: float = _DEFAULT_SETTLEMENT_TIMEOUT,
+        on_initialized: InitializationObserver | None = None,
     ) -> None:
         self._transport_factory = transport_factory
         self._settlement_timeout = settlement_timeout
+        self._on_initialized = on_initialized
 
     async def run(self, contract: AuditContract) -> AuditResult:
         """Execute one contract and always close an initialized transport."""
@@ -48,6 +51,8 @@ class ForegroundAuditor:
             )
             resolved_model = resolution.resolved
             await transport.select_model(resolved_model)
+            if self._on_initialized is not None:
+                await self._on_initialized(resolved_model)
             await transport.send(_render_prompt(contract))
             result = await self._consume_result(
                 transport,

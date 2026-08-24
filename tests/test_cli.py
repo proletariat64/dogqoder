@@ -90,7 +90,7 @@ async def test_json_spawn_exits_zero_on_acceptance_without_claiming_completion(
     server = RPCServer(supervisor, socket_path)
     await server.start()
     spec_file = tmp_path / "audit-spec.txt"
-    spec_file.write_text("audit task six CLI semantics", encoding="utf-8")
+    spec_file.write_text("x" * 70_000, encoding="utf-8")
     stdout = StringIO()
 
     exit_code = await run(
@@ -148,3 +148,60 @@ async def test_qworker_console_entrypoint_emits_json_connection_error(
             "message": "qworker supervisor is unavailable.",
         },
     }
+
+
+async def test_follow_watch_disconnect_after_ack_is_structured_failure(
+    tmp_path: Path,
+) -> None:
+    socket_path = tmp_path / "dropped-watch.sock"
+
+    async def acknowledge_then_drop(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        request = json.loads(await reader.readline())
+        writer.write(
+            json.dumps(
+                {
+                    "request_id": request["request_id"],
+                    "ok": True,
+                    "result": {
+                        "worker_id": "worker-1",
+                        "since": 0,
+                        "follow": True,
+                    },
+                }
+            ).encode()
+            + b"\n"
+        )
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    server = await asyncio.start_unix_server(
+        acknowledge_then_drop, path=socket_path
+    )
+    stdout = StringIO()
+
+    exit_code = await run(
+        [
+            "--socket",
+            str(socket_path),
+            "watch",
+            "worker-1",
+            "--follow",
+            "--json",
+        ],
+        stdin=StringIO(),
+        stdout=stdout,
+    )
+
+    assert exit_code == 3
+    assert json.loads(stdout.getvalue()) == {
+        "ok": False,
+        "error": {
+            "code": "supervisor_unavailable",
+            "message": "qworker watch connection ended before a terminal frame.",
+        },
+    }
+    server.close()
+    await server.wait_closed()

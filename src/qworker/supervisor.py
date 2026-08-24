@@ -80,8 +80,7 @@ class Supervisor:
         """Return durable current worker state and latest persisted cursor."""
 
         worker = await self._require_worker(worker_id)
-        events = await self._store.events_since(worker_id)
-        cursor = events[-1].sequence if events else 0
+        cursor = await self._store.latest_event_cursor(worker_id)
         return _worker_json(worker, event_cursor=cursor)
 
     async def result(self, worker_id: str) -> dict[str, JsonValue] | None:
@@ -144,19 +143,31 @@ class Supervisor:
         await self._store.close()
 
     async def _run_worker(self, worker_id: str, contract: AuditContract) -> None:
-        await self._append_event(
-            worker_id,
-            "worker.state_changed",
-            {"schema_version": 1, "state": "running"},
-        )
-        await self._append_event(
-            worker_id,
-            "worker.health_changed",
-            {"schema_version": 1, "health": "healthy"},
-        )
+        initialized = False
+
+        async def on_initialized(resolved_model: str) -> None:
+            nonlocal initialized
+            await self._append_event(
+                worker_id,
+                "model.resolved",
+                {"schema_version": 1, "model": resolved_model},
+            )
+            await self._append_event(
+                worker_id,
+                "worker.state_changed",
+                {"schema_version": 1, "state": "running"},
+            )
+            await self._append_event(
+                worker_id,
+                "worker.health_changed",
+                {"schema_version": 1, "health": "healthy"},
+            )
+            initialized = True
+
         auditor = ForegroundAuditor(
             self._transport_factory,
             settlement_timeout=self._settlement_timeout,
+            on_initialized=on_initialized,
         )
         try:
             result = await auditor.run(contract)
@@ -165,12 +176,6 @@ class Supervisor:
         except Exception:  # noqa: BLE001 -- isolate an arbitrary transport failure
             result = _execution_failure(contract)
 
-        if result.resolved_model is not None:
-            await self._append_event(
-                worker_id,
-                "model.resolved",
-                {"schema_version": 1, "model": result.resolved_model},
-            )
         await self._store.record_result(
             worker_id,
             outcome=result.outcome,
@@ -189,6 +194,12 @@ class Supervisor:
                 {"schema_version": 1, "code": warning},
             )
         terminal_state = "failed" if result.outcome == "failed" else "completed"
+        if initialized:
+            await self._append_event(
+                worker_id,
+                "worker.health_changed",
+                {"schema_version": 1, "health": "exited"},
+            )
         await self._append_event(
             worker_id,
             "worker.state_changed",

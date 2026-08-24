@@ -31,6 +31,17 @@ _CROCKFORD_BASE32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 _TERMINAL_STATES = frozenset(("completed", "failed", "cancelled", "lost"))
 _WORKER_HEALTH = frozenset(("unknown", "healthy", "quiet", "stalled", "exited"))
 _EVENT_SCHEMA_VERSION = 1
+_CREDENTIAL_ENV_VARS = (
+    "QODER_PERSONAL_ACCESS_TOKEN",
+    "QODER_SERVICE_ACCOUNT_KEY",
+    "QODERCN_PERSONAL_ACCESS_TOKEN",
+    "QODERCN_SERVICE_ACCOUNT_KEY",
+)
+_MAX_RESULT_STRING_CHARS = 4096
+_MAX_RESULT_COLLECTION_ITEMS = 128
+_MAX_RESULT_DEPTH = 6
+_MAX_RESULT_NODES = 2048
+_MAX_RESULT_TEXT_CHARS = 256 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +105,26 @@ _CREDENTIAL_MARKER = re.compile(
 )
 _JWT = re.compile(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\Z")
 _AWS_ACCESS_KEY = re.compile(r"AKIA[A-Z0-9]{16}\Z")
+_INLINE_CREDENTIAL = re.compile(
+    r"(?<![A-Za-z0-9])(?:"
+    r"(?:sk|pk)[-_][A-Za-z0-9][A-Za-z0-9._-]{2,}"
+    r"|Bearer[ ._-]+[A-Za-z0-9._~+/=-]{4,}"
+    r"|AKIA[A-Z0-9]{16}"
+    r"|[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}"
+    r")(?![A-Za-z0-9])",
+    re.IGNORECASE,
+)
+_KEYED_CREDENTIAL = re.compile(
+    r"\b(?:api[_ -]?key|access[_ -]?token|secret|credential|password|authorization)"
+    r"\b(?:\s*[:=]\s*|\s+)[^\s,;]+",
+    re.IGNORECASE,
+)
+
+
+@dataclass(slots=True)
+class _ResultBudget:
+    nodes: int = _MAX_RESULT_NODES
+    text_chars: int = _MAX_RESULT_TEXT_CHARS
 
 
 def _safe_metadata(value: JsonValue) -> bool:
@@ -456,7 +487,7 @@ class WorkerStore:
     ) -> EventRecord:
         """Persist a structured result and its semantic event in one transaction."""
 
-        safe_result = _copy_json_object(result_summary)
+        safe_result = _safe_result_summary(result_summary)
         if resolved_model is not None and not _MODEL(resolved_model):
             raise ValueError("Unsafe worker result field: resolved_model")
         if any(not _MODEL(model) for model in actual_models):
@@ -521,6 +552,16 @@ class WorkerStore:
             "SELECT * FROM workers WHERE worker_id = ?", (worker_id,)
         ).fetchone()
         return _worker_from_row(row) if row is not None else None
+
+    async def latest_event_cursor(self, worker_id: str) -> int:
+        """Return the latest per-worker sequence without loading event history."""
+
+        connection = self._open()
+        row = connection.execute(
+            "SELECT COALESCE(MAX(sequence), 0) AS cursor FROM events WHERE worker_id = ?",
+            (worker_id,),
+        ).fetchone()
+        return int(row["cursor"])
 
     async def events_since(
         self, worker_id: str, since: int = 0
@@ -830,6 +871,61 @@ def _copy_json_object(payload: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
     ):
         raise TypeError("Event payload must be a JSON object.")
     return cast(dict[str, JsonValue], decoded)
+
+
+def _safe_result_summary(
+    result_summary: Mapping[str, JsonValue],
+) -> dict[str, JsonValue]:
+    copied = _copy_json_object(result_summary)
+    sanitized = _sanitize_result_value(copied, depth=0, budget=_ResultBudget())
+    if not isinstance(sanitized, dict):
+        raise TypeError("Structured result must remain a JSON object.")
+    return sanitized
+
+
+def _sanitize_result_value(
+    value: JsonValue, *, depth: int, budget: _ResultBudget
+) -> JsonValue:
+    if budget.nodes <= 0 or depth > _MAX_RESULT_DEPTH:
+        return None
+    budget.nodes -= 1
+    if isinstance(value, str):
+        return _safe_result_text(value, budget)
+    if isinstance(value, list):
+        sanitized_list: list[JsonValue] = []
+        for index, item in enumerate(value):
+            if index == _MAX_RESULT_COLLECTION_ITEMS or budget.nodes <= 0:
+                break
+            sanitized_list.append(
+                _sanitize_result_value(item, depth=depth + 1, budget=budget)
+            )
+        return sanitized_list
+    if isinstance(value, dict):
+        sanitized_object: dict[str, JsonValue] = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index == _MAX_RESULT_COLLECTION_ITEMS or budget.nodes <= 0:
+                break
+            safe_key = _safe_result_text(key, budget)
+            sanitized_object[safe_key] = _sanitize_result_value(
+                item, depth=depth + 1, budget=budget
+            )
+        return sanitized_object
+    return value
+
+
+def _safe_result_text(value: str, budget: _ResultBudget) -> str:
+    safe = value
+    for variable in _CREDENTIAL_ENV_VARS:
+        secret = os.environ.get(variable)
+        if secret:
+            safe = safe.replace(secret, "[REDACTED]")
+    safe = _INLINE_CREDENTIAL.sub("[REDACTED]", safe)
+    safe = _KEYED_CREDENTIAL.sub("[REDACTED]", safe)
+    limit = min(_MAX_RESULT_STRING_CHARS, max(budget.text_chars, 0))
+    if len(safe) > limit:
+        safe = safe[: max(limit - 3, 0)] + ("..." if limit >= 3 else "")
+    budget.text_chars -= len(safe)
+    return safe
 
 
 def _load_json_object(raw: str | None) -> dict[str, object] | None:

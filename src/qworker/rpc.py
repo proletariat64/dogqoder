@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import re
 import signal
 import stat
 import sys
@@ -18,6 +19,18 @@ from qworker.store import JsonValue
 from qworker.supervisor import Supervisor, SupervisorError
 
 type JsonObject = dict[str, JsonValue]
+
+_MAX_FRAME_BYTES = 4 * 1024 * 1024
+_TERMINAL_STATES = frozenset(("completed", "failed", "cancelled", "lost"))
+_REQUEST_ID_PATTERN = re.compile(
+    rb'"request_id"\s*:\s*("(?:\\.|[^"\\])*")'
+)
+
+
+class _FrameTooLargeError(Exception):
+    def __init__(self, request_id: JsonValue = None) -> None:
+        super().__init__(_frame_limit_message())
+        self.request_id = request_id
 
 
 class RPCServer:
@@ -54,6 +67,7 @@ class RPCServer:
         self._server = await asyncio.start_unix_server(
             self._handle_connection,
             path=self._socket_path,
+            limit=_MAX_FRAME_BYTES,
         )
         if os.name == "posix":
             self._socket_path.chmod(0o600)
@@ -89,9 +103,12 @@ class RPCServer:
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
         try:
-            while line := await reader.readline():
+            while True:
                 request_id: JsonValue = None
                 try:
+                    line = await _read_frame(reader)
+                    if line is None:
+                        return
                     request = _decode_request(line)
                     request_id = request["request_id"]
                     method = cast(str, request["method"])
@@ -111,6 +128,16 @@ class RPCServer:
                         writer,
                         _failure(request_id, "invalid_request", str(error)),
                     )
+                except _FrameTooLargeError as error:
+                    await _write_frame(
+                        writer,
+                        _failure(
+                            error.request_id if error.request_id is not None else request_id,
+                            "frame_too_large",
+                            _frame_limit_message(),
+                        ),
+                    )
+                    return
                 except Exception:  # noqa: BLE001 -- isolate one RPC connection
                     await _write_frame(
                         writer,
@@ -190,6 +217,25 @@ class RPCServer:
             follow=follow,
         ):
             await _write_frame(writer, _success(request_id, {"event": event}))
+        status = await self._supervisor.status(worker_id)
+        state = status["state"]
+        cursor = status["event_cursor"]
+        if not isinstance(state, str) or not isinstance(cursor, int):
+            raise SupervisorError(
+                "sdk_protocol_error", "Worker status has invalid watch metadata."
+            )
+        if follow and state not in _TERMINAL_STATES:
+            raise SupervisorError(
+                "worker_not_live", "Follow watch ended before worker termination."
+            )
+        reason = "terminal" if follow else "replay_complete"
+        await _write_frame(
+            writer,
+            _success(
+                request_id,
+                {"end": {"reason": reason, "cursor": cursor, "state": state}},
+            ),
+        )
 
 
 class RPCClientError(Exception):
@@ -213,14 +259,17 @@ async def call(
     correlation_id = request_id or str(uuid.uuid4())
     reader, writer = await _open_connection(socket_path)
     try:
-        await _write_frame(
-            writer,
-            {
-                "request_id": correlation_id,
-                "method": method,
-                "params": params,
-            },
-        )
+        try:
+            await _write_frame(
+                writer,
+                {
+                    "request_id": correlation_id,
+                    "method": method,
+                    "params": params,
+                },
+            )
+        except _FrameTooLargeError:
+            raise RPCClientError("frame_too_large", _frame_limit_message()) from None
         response = await _read_response(reader, correlation_id)
         return response["result"]
     finally:
@@ -240,28 +289,75 @@ async def watch(
     correlation_id = request_id or str(uuid.uuid4())
     reader, writer = await _open_connection(socket_path)
     try:
-        await _write_frame(
-            writer,
-            {
-                "request_id": correlation_id,
-                "method": "watch",
-                "params": params,
-            },
-        )
+        try:
+            await _write_frame(
+                writer,
+                {
+                    "request_id": correlation_id,
+                    "method": "watch",
+                    "params": params,
+                },
+            )
+        except _FrameTooLargeError:
+            raise RPCClientError("frame_too_large", _frame_limit_message()) from None
         await _read_response(reader, correlation_id)
-        while line := await reader.readline():
+        follow = params.get("follow") is True
+        while True:
+            try:
+                line = await _read_frame(reader, request_id=correlation_id)
+            except _FrameTooLargeError:
+                raise RPCClientError(
+                    "frame_too_large", _frame_limit_message()
+                ) from None
+            except (ConnectionError, OSError):
+                raise RPCClientError(
+                    "supervisor_unavailable",
+                    "qworker watch connection ended before a terminal frame.",
+                ) from None
+            if line is None:
+                raise RPCClientError(
+                    "supervisor_unavailable",
+                    "qworker watch connection ended before a terminal frame.",
+                )
             response = _validated_response(line, correlation_id)
             result = response["result"]
-            if not isinstance(result, dict) or set(result) != {"event"}:
+            if not isinstance(result, dict):
                 raise RPCClientError(
                     "sdk_protocol_error", "Supervisor returned an invalid watch frame."
                 )
-            event = result["event"]
-            if not isinstance(event, dict):
+            if set(result) == {"event"}:
+                event = result["event"]
+                if not isinstance(event, dict):
+                    raise RPCClientError(
+                        "sdk_protocol_error", "Supervisor returned an invalid event."
+                    )
+                yield event
+                continue
+            if set(result) != {"end"} or not isinstance(result["end"], dict):
                 raise RPCClientError(
-                    "sdk_protocol_error", "Supervisor returned an invalid event."
+                    "sdk_protocol_error", "Supervisor returned an invalid watch frame."
                 )
-            yield event
+            end = result["end"]
+            if set(end) != {"reason", "cursor", "state"}:
+                raise RPCClientError(
+                    "sdk_protocol_error", "Supervisor returned an invalid watch end."
+                )
+            reason = end["reason"]
+            cursor = end["cursor"]
+            state = end["state"]
+            expected_reason = "terminal" if follow else "replay_complete"
+            if (
+                reason != expected_reason
+                or not isinstance(cursor, int)
+                or isinstance(cursor, bool)
+                or cursor < 0
+                or not isinstance(state, str)
+                or (follow and state not in _TERMINAL_STATES)
+            ):
+                raise RPCClientError(
+                    "sdk_protocol_error", "Supervisor returned an invalid watch end."
+                )
+            return
     finally:
         writer.close()
         with suppress(BrokenPipeError, ConnectionResetError):
@@ -272,7 +368,9 @@ async def _open_connection(
     socket_path: Path,
 ) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
     try:
-        return await asyncio.open_unix_connection(socket_path)
+        return await asyncio.open_unix_connection(
+            socket_path, limit=_MAX_FRAME_BYTES
+        )
     except OSError:
         raise RPCClientError(
             "supervisor_unavailable", "qworker supervisor is unavailable."
@@ -293,7 +391,14 @@ async def _socket_is_active(socket_path: Path) -> bool:
 
 
 async def _read_response(reader: asyncio.StreamReader, request_id: str) -> JsonObject:
-    line = await reader.readline()
+    try:
+        line = await _read_frame(reader, request_id=request_id)
+    except _FrameTooLargeError:
+        raise RPCClientError("frame_too_large", _frame_limit_message()) from None
+    except (ConnectionError, OSError):
+        raise RPCClientError(
+            "supervisor_unavailable", "Supervisor connection was interrupted."
+        ) from None
     if not line:
         raise RPCClientError(
             "sdk_protocol_error", "Supervisor closed without a response."
@@ -435,10 +540,48 @@ def _failure(request_id: JsonValue, code: str, message: str) -> JsonObject:
 
 
 async def _write_frame(writer: asyncio.StreamWriter, frame: JsonObject) -> None:
-    writer.write(
-        json.dumps(frame, separators=(",", ":"), sort_keys=True).encode("utf-8") + b"\n"
-    )
+    encoded = json.dumps(frame, separators=(",", ":")).encode("utf-8") + b"\n"
+    if len(encoded) > _MAX_FRAME_BYTES:
+        raise _FrameTooLargeError(frame.get("request_id"))
+    writer.write(encoded)
     await writer.drain()
+
+
+async def _read_frame(
+    reader: asyncio.StreamReader, *, request_id: JsonValue = None
+) -> bytes | None:
+    try:
+        frame = await reader.readuntil(b"\n")
+    except asyncio.IncompleteReadError as error:
+        if not error.partial:
+            return None
+        frame = error.partial
+    except asyncio.LimitOverrunError as error:
+        prefix_size = min(error.consumed, _MAX_FRAME_BYTES)
+        prefix = await reader.readexactly(prefix_size)
+        raise _FrameTooLargeError(
+            request_id if request_id is not None else _request_id_from_prefix(prefix)
+        ) from None
+    if len(frame) > _MAX_FRAME_BYTES:
+        raise _FrameTooLargeError(
+            request_id if request_id is not None else _request_id_from_prefix(frame)
+        )
+    return frame
+
+
+def _request_id_from_prefix(prefix: bytes) -> JsonValue:
+    match = _REQUEST_ID_PATTERN.search(prefix)
+    if match is None:
+        return None
+    try:
+        decoded: object = json.loads(match.group(1))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    return decoded if isinstance(decoded, str) else None
+
+
+def _frame_limit_message() -> str:
+    return f"RPC frame exceeds the {_MAX_FRAME_BYTES}-byte limit."
 
 
 def default_state_dir() -> Path:
