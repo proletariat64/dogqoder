@@ -475,10 +475,15 @@ class Supervisor:
             )
             raise
         except (BrokenPipeError, ConnectionResetError, EOFError):
+            missing_state = (
+                "cancelled"
+                if (worker_id, attempt) in self._stop_requests
+                else "lost"
+            )
             await self._finalize_without_result(
                 worker_id,
                 attempt,
-                missing_state="lost",
+                missing_state=missing_state,
             )
             return
         except Exception:  # noqa: BLE001 -- isolate an arbitrary transport failure

@@ -126,6 +126,10 @@ class ForegroundAuditor:
                     reducer.apply(event)
                     if not reducer.needs_settlement:
                         return reducer.finish(settlement_expired=False)
+        except (BrokenPipeError, ConnectionResetError, EOFError):
+            return reducer.finish(settlement_expired=True)
+        except asyncio.CancelledError:
+            return reducer.finish(settlement_expired=True)
         except TimeoutError:
             return reducer.finish(settlement_expired=True)
 

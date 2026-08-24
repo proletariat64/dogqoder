@@ -10,7 +10,7 @@ from qoder_agent_sdk import ProcessError
 from qworker.cli import run
 from qworker.control import ControlCallbacks, PermissionRequest
 from qworker.domain import AuditContract
-from qworker.events import AdapterEvent, ResultEvent
+from qworker.events import AdapterEvent, ResultEvent, TaskStartedEvent
 from qworker.lifecycle import WorkerStateReducer
 from qworker.model_policy import AvailableModel
 from qworker.qoder_sdk import QoderSDKTransport
@@ -160,6 +160,36 @@ async def test_graceful_stop_interrupts_then_disconnects_and_denies_approvals(
     await supervisor.close()
 
 
+async def test_graceful_stop_induced_eof_is_cancelled(tmp_path: Path) -> None:
+    class InterruptEOFTransport(StoppableFakeQoderTransport):
+        async def interrupt(self) -> None:
+            self._order.append("interrupt")
+            self.exit()
+
+        async def messages(self) -> AsyncIterator[AdapterEvent]:
+            await self._finish.wait()
+            raise EOFError("interrupt closed QoderCLI stream")
+            yield  # pragma: no cover - retain async-generator shape
+
+    order: list[str] = []
+    transport = InterruptEOFTransport(order)
+    supervisor = Supervisor(
+        WorkerStore(tmp_path / "state"),
+        lambda _cwd: transport,
+        sdk_version="1.0.13",
+        stop_timeout=0.1,
+    )
+    worker_id = await _spawn_running(supervisor, tmp_path)
+
+    stopped = await supervisor.stop(worker_id)
+
+    assert stopped["state"] == "cancelled"
+    assert stopped["health"] == "exited"
+    assert await supervisor.result(worker_id) is None
+    assert order == ["interrupt", "disconnect"]
+    await supervisor.close()
+
+
 async def test_force_stop_skips_interrupt_and_preserves_workspace_files(
     tmp_path: Path,
 ) -> None:
@@ -183,6 +213,46 @@ async def test_force_stop_skips_interrupt_and_preserves_workspace_files(
     assert order == ["disconnect"]
     assert existing.read_text(encoding="utf-8") == "caller state\n"
     assert transport.disconnected is True
+    await supervisor.close()
+
+
+async def test_force_stop_induced_eof_is_cancelled(tmp_path: Path) -> None:
+    class DisconnectEOFTransport(StoppableFakeQoderTransport):
+        def __init__(self, order: list[str]) -> None:
+            super().__init__(order)
+            self._disconnect_started = asyncio.Event()
+            self._disconnecting = False
+
+        async def messages(self) -> AsyncIterator[AdapterEvent]:
+            await self._disconnect_started.wait()
+            raise EOFError("disconnect closed QoderCLI stream")
+            yield  # pragma: no cover - retain async-generator shape
+
+        async def disconnect(self) -> None:
+            if self.disconnected or self._disconnecting:
+                return
+            self._disconnecting = True
+            self._order.append("disconnect")
+            self._disconnect_started.set()
+            for _ in range(10):
+                await asyncio.sleep(0)
+            self.disconnected = True
+
+    order: list[str] = []
+    transport = DisconnectEOFTransport(order)
+    supervisor = Supervisor(
+        WorkerStore(tmp_path / "state"),
+        lambda _cwd: transport,
+        sdk_version="1.0.13",
+    )
+    worker_id = await _spawn_running(supervisor, tmp_path)
+
+    stopped = await supervisor.stop(worker_id, force=True)
+
+    assert stopped["state"] == "cancelled"
+    assert stopped["health"] == "exited"
+    assert await supervisor.result(worker_id) is None
+    assert order == ["disconnect"]
     await supervisor.close()
 
 
@@ -349,6 +419,68 @@ async def test_eof_after_result_preserves_result_derived_completion(
     await supervisor.close()
 
 
+@pytest.mark.parametrize("exceptional_eof", (False, True))
+@pytest.mark.parametrize("is_error", (False, True))
+async def test_eof_during_nested_settlement_preserves_main_result(
+    tmp_path: Path,
+    exceptional_eof: bool,
+    is_error: bool,
+) -> None:
+    class SettlementEOFTransport(FakeQoderTransport):
+        async def messages(self) -> AsyncIterator[AdapterEvent]:
+            yield TaskStartedEvent(
+                task_id="nested-unsettled",
+                description="inspect nested behavior",
+            )
+            yield ResultEvent(
+                session_id="session-before-eof",
+                is_error=is_error,
+                result=SUCCESSFUL_AUDIT_REPORT,
+                model_usage=("Qwen3.8-Max",),
+                errors=("model_error",) if is_error else (),
+            )
+            if exceptional_eof:
+                raise EOFError("QoderCLI exited during settlement")
+
+    transport = SettlementEOFTransport(
+        models=(AvailableModel(value="Qwen3.8-Max", enabled=True),),
+        events=(),
+    )
+    store = WorkerStore(tmp_path / "state")
+    supervisor = Supervisor(
+        store,
+        lambda _cwd: transport,
+        sdk_version="1.0.13",
+    )
+    accepted = await supervisor.spawn(
+        AuditContract(objective="preserve settled result", cwd=tmp_path)
+    )
+    worker_id = str(accepted["worker_id"])
+    events = [
+        event async for event in supervisor.watch(worker_id, since=0, follow=True)
+    ]
+
+    expected_state = "failed" if is_error else "completed"
+    status = await supervisor.status(worker_id)
+    result = await supervisor.result(worker_id)
+    assert status["state"] == expected_state
+    assert status["health"] == "exited"
+    assert result is not None
+    assert result["outcome"] == expected_state
+    assert result["session_id"] == "session-before-eof"
+    assert result["nested_state"] == "unknown"
+    warnings = result["warnings"]
+    assert isinstance(warnings, list)
+    assert "nested_terminal_event_missing" in warnings
+    assert [event["type"] for event in events][-3:] == [
+        "worker.warning",
+        "worker.health_changed",
+        "worker.state_changed",
+    ]
+    assert any(event["type"] == "result.received" for event in events)
+    await supervisor.close()
+
+
 async def test_result_wins_a_graceful_stop_race(tmp_path: Path) -> None:
     order: list[str] = []
     transport = StoppableFakeQoderTransport(order, result_after_interrupt=True)
@@ -367,6 +499,64 @@ async def test_result_wins_a_graceful_stop_race(tmp_path: Path) -> None:
     assert result is not None
     assert result["session_id"] == "session-after-interrupt"
     assert order == ["interrupt", "disconnect"]
+    await supervisor.close()
+
+
+@pytest.mark.parametrize("is_error", (False, True))
+async def test_force_stop_preserves_result_already_seen_during_settlement(
+    tmp_path: Path,
+    is_error: bool,
+) -> None:
+    class ResultThenDisconnectEOFTransport(FakeQoderTransport):
+        def __init__(self) -> None:
+            super().__init__(
+                models=(AvailableModel(value="Qwen3.8-Max", enabled=True),),
+                events=(),
+            )
+            self.result_seen = asyncio.Event()
+            self._disconnect_started = asyncio.Event()
+
+        async def messages(self) -> AsyncIterator[AdapterEvent]:
+            yield TaskStartedEvent(
+                task_id="nested-before-force",
+                description="settlement still pending",
+            )
+            yield ResultEvent(
+                session_id="session-before-force",
+                is_error=is_error,
+                result=SUCCESSFUL_AUDIT_REPORT,
+                errors=("model_error",) if is_error else (),
+            )
+            self.result_seen.set()
+            await self._disconnect_started.wait()
+            raise EOFError("force disconnect ended settlement")
+
+        async def disconnect(self) -> None:
+            self.disconnected = True
+            self._disconnect_started.set()
+
+    transport = ResultThenDisconnectEOFTransport()
+    supervisor = Supervisor(
+        WorkerStore(tmp_path / "state"),
+        lambda _cwd: transport,
+        sdk_version="1.0.13",
+        settlement_timeout=60,
+    )
+    worker_id = await _spawn_running(supervisor, tmp_path)
+    await asyncio.wait_for(transport.result_seen.wait(), timeout=0.2)
+
+    stopped = await supervisor.stop(worker_id, force=True)
+
+    expected_state = "failed" if is_error else "completed"
+    result = await supervisor.result(worker_id)
+    assert stopped["state"] == expected_state
+    assert result is not None
+    assert result["outcome"] == expected_state
+    assert result["session_id"] == "session-before-force"
+    assert result["nested_state"] == "unknown"
+    warnings = result["warnings"]
+    assert isinstance(warnings, list)
+    assert "nested_terminal_event_missing" in warnings
     await supervisor.close()
 
 
