@@ -6,10 +6,10 @@ Date: 2026-08-24
 
 V1 is **not yet fully accepted**. Credential-free public-interface coverage now
 demonstrates most lifecycle, control, persistence, recovery, and security
-contracts. Acceptance criterion 7 remains blocked because the public supervisor
-does not expose direct-subagent task events or a post-run transcript-discovery
-API. Criteria 5, 6, and 11 have deterministic seam evidence but still lack the
-corresponding bounded real-Qoder evidence required by design section 17.3.
+contracts. The three authorized one-shot closing markers produced useful but
+non-passing evidence for criteria 5, 6, and 11, so those criteria remain partial.
+Acceptance criterion 7 is **Waived — QoderCLI limitation** by explicit user
+decision; a waiver records the unsupported boundary and is not a demonstration.
 
 This report distinguishes deterministic guarantees from live observations. A
 fake transport proves qworker behavior at its stable CLI/RPC/transport seams; it
@@ -44,8 +44,11 @@ Status meanings:
 - **Live-confirmed**: deterministic evidence plus a bounded observation from the
   installed credentialed Qoder runtime.
 - **Partial**: deterministic behavior is proven, but a required live-runtime or
-  OS-process observation is absent.
+  OS-process observation is absent or did not satisfy every required gate.
 - **Blocked**: required public capability or trustworthy evidence is absent.
+- **Waived — QoderCLI limitation**: the user accepted that the installed runtime
+  boundary cannot supply the required evidence; this does not mean the criterion
+  passed.
 
 | AC | Status | Evidence and observed boundary |
 | --- | --- | --- |
@@ -53,62 +56,62 @@ Status meanings:
 | 2 | Demonstrated | Same test uses fresh CLI processes for `status`, `watch`, `steer`, `cancel-message`, `respond`, and `result` while one supervisor owns both attempts. |
 | 3 | Demonstrated | Same test replays from zero, reconnects with the last cursor, follows to terminal state, and asserts contiguous per-worker sequences without cross-worker events. |
 | 4 | Live-confirmed | The deterministic lifecycle test proves requested `qwen-auditor`, resolved `Qwen3.8-Max`, and actual `Qwen3.8-Max` fields at the public result boundary. The authorized live rerun confirmed accepted/starting/running/result/completed lifecycle, no requires-action/lost/failed state, bundled runtime selection, and resolved plus actual `Qwen3.8-Max` reporting. |
-| 5 | Partial | `test_public_coder_edits_disposable_workspace_without_leaking_credentials` drives `spawn --role coder`, watch, and result against a disposable workspace; the transport edit and validation report cross the public boundary with no `.git` worktree. A real-Qoder coder was intentionally not run in this bounded UAT. |
-| 6 | Partial | `test_auditor_callback_denies_top_level_and_direct_helper_mutation` invokes the actual configured SDK callback for top-level and nested contexts. Write, edit, notebook, shell, unknown, mutation-capable extension, and nested recursion requests are denied and the workspace byte snapshot is unchanged. No live agent was prompted to attempt every denial. |
-| 7 | Blocked | Adapter contract coverage normalizes Qoder task-start/progress/terminal messages, and the new lifecycle fixture emits direct-helper task events. The public supervisor persists neither those task events nor a transcript locator. Context7 exposed cloud session endpoints, not a local Python transcript API. No post-run helper transcript can therefore be discovered through qworker's public CLI. |
+| 5 | Partial | `test_public_coder_edits_disposable_workspace_without_leaking_credentials` demonstrates the public coder contract deterministically. The one authorized real marker created the exact requested file in a disposable non-worktree and reported resolved/actual `Qwen3.8-Max`, but its terminal result was not `completed` and contained neither the required file report nor a nonempty validation list. |
+| 6 | Partial | Deterministic callback tests deny top-level and nested Write/Edit/Bash requests and prove the safe probe discards inputs and agent IDs. In the one authorized adversarial live marker, the workspace remained byte-identical and credential-free, but QoderCLI emitted none of the requested top-level or helper permission callbacks, including no top-level Agent request, and the structured result did not complete. The live denial boundary is therefore unproven. |
+| 7 | Waived — QoderCLI limitation | Adapter fixtures can normalize task messages, but the installed live QoderCLI/SDK path did not provide a trustworthy public correlation from worker task telemetry to post-run direct-helper discovery. The SDK's transcript readers are standalone local functions keyed by a session UUID; qworker's public result intentionally does not expose that locator or persist direct-helper task events. Context7 returned cloud-session material rather than a supported local worker correlation flow. The user explicitly waived AC7; it is not accepted as demonstrated. |
 | 8 | Demonstrated | The lifecycle test emits task start/progress without terminal telemetry. Both public results finish with `nested_state=unknown` and warning `nested_terminal_event_missing`; neither worker stays running. |
 | 9 | Demonstrated | The lifecycle test sends `now`, `next`, and `later` through separate CLI processes, validates UUIDs and priorities, observes queued/delivered durable events, and cancels one UUID-stamped message. Cancellation is asserted as the injected transport observation, not a universal guarantee. |
 | 10 | Demonstrated | The lifecycle test answers a currently live permission request through `respond`. `test_public_loss_expires_live_approval_and_rejects_response` then proves an approval expires on loss and later response fails with `approval_not_pending`. |
-| 11 | Partial | `test_public_stop_preserves_edits_and_disconnects_live_child` rejects nested stop, performs normal top-level stop, preserves an existing workspace edit, reaches cancelled/exited, and observes its transport child as disconnected. It does not inspect a real QoderCLI OS child. |
+| 11 | Partial | The deterministic stop test reaches cancelled/exited, preserves an edit, and disconnects its child. The one authorized live marker observed running, invoked non-forced stop, preserved the disposable edit, reached exited health, and verified that the exact SDK-owned PID/start-time identity disappeared using only `/proc/<pid>/stat`. Its returned terminal state was not `cancelled`, so the marker did not pass and AC11 is not claimed as live-confirmed. |
 | 12 | Demonstrated | The loss test observes `lost`/`exited`. `test_public_resume_uses_same_id_cwd_session_and_new_attempt` uses a later CLI process to keep the stable ID and canonical cwd, pass the stored session to a fresh transport factory, increment attempt 1 to 2, send recovery text, and preserve partial edits. Prior live adapter resume evidence is recorded separately in `docs/research/2026-08-24-qoder-task-9-10-uat.md`; it was not rerun here. |
 | 13 | Demonstrated | The public coder security test sends a credential-bearing objective only over stdin, asserts it is absent from process arguments, stdout/stderr, watch events, result JSON, transport call categories, SQLite/WAL files, and workspace files. Failure-suite redaction tests cover recursive diagnostic/log/store boundaries. |
 | 14 | Demonstrated | The lifecycle test rejects selected nested-agent steering and the stop test rejects selected nested-agent stop with explicit `unsupported_operation`; neither path reports success. |
 
 ## Default verification
 
-Focused public-interface checks completed before any live test:
+Focused public-interface checks completed before the AC5/AC6/AC11 live tests:
 
 ```bash
-uv run pytest tests/integration/test_real_worker_lifecycle.py -m 'not real_qoder' -q
-# 2 passed, 1 deselected
-
-uv run pytest tests/integration/test_real_auditor_security.py -m 'not real_qoder' -q
-# 2 passed
-
-uv run pytest tests/integration/test_real_resume.py -m 'not real_qoder' -q
-# 3 passed
+uv run pytest tests/integration/test_real_worker_lifecycle.py tests/integration/test_real_auditor_security.py tests/integration/test_real_resume.py -m 'not real_qoder' -q
+# 10 passed, 4 deselected in 16.89s
 ```
 
-Final repository verification commands and their exact outcomes are recorded
-after the suite completes:
+The first full default-suite run encountered one timeout in the unrelated
+`test_rpc_over_limit_request_with_near_limit_id_stays_structured` test. That
+node passed immediately in isolation, and subsequent complete default-suite
+runs passed; the final run was:
 
 ```bash
-uv run pytest -m 'not real_qoder' -q
-# 259 passed, 4 deselected in 33.21s
+uv run pytest tests/test_supervisor_rpc.py::test_rpc_over_limit_request_with_near_limit_id_stays_structured -q
+# 1 passed in 0.73s
+
+uv run pytest -q
+# 262 passed, 7 deselected in 21.57s
 
 uv run ruff format --check src tests
-# Failed: 7 pre-existing/shared files outside Task 14 scope would be reformatted:
-# src/qworker/control.py, src/qworker/store.py, tests/test_cli.py,
-# tests/test_resume.py, tests/test_stop_and_loss.py,
-# tests/test_supervisor_rpc.py, tests/test_worker_control.py
+# Failed: 7 shared files outside Task 14 scope would be reformatted
 
 uv run ruff format --check tests/integration/test_real_worker_lifecycle.py tests/integration/test_real_auditor_security.py tests/integration/test_real_resume.py
 # 3 files already formatted
 
-uv run ruff check src tests
+uv run ruff check tests/integration/test_real_auditor_security.py tests/integration/test_real_resume.py
 # All checks passed
 
 uv run mypy src tests
 # Success: no issues found in 48 source files
+
+git diff --check
+# clean
 ```
 
 ## Bounded real-Qoder marker UAT
 
-Only the newly added Task 14 marker test may run. Existing `real_qoder` tests
-and earlier Tasks 9–10 UATs are excluded. The test uses a pytest disposable
-directory, sends the objective over stdin, captures child stdout/stderr, applies
-per-process and outer timeouts, performs no write request, and emits no token,
-session ID, prompt, marker, or model response.
+Only the specifically authorized Task 14 marker nodes ran. Existing
+`real_qoder` tests and earlier Tasks 9–10 UATs were excluded. Each test used a
+pytest disposable directory, sent its objective over stdin, captured child
+stdout/stderr, applied per-process plus 190-second in-test and 210-second outer
+timeouts, and emitted no token, session ID, prompt, marker, transcript, or model
+response. The AC5/AC6/AC11 nodes ran serially exactly once each with no retry.
 
 Initial one-shot diagnostic:
 
@@ -164,13 +167,60 @@ the private marker in the structured summary, and an unchanged disposable
 workspace byte snapshot also passed. Captured output contained only pytest's
 pass summary. No other real test ran and the authorized rerun was not retried.
 
+### Authorized AC5, AC6, and AC11 one-shot markers
+
+After deterministic safe-evidence regressions and the credential-free matrix
+passed, the user authorized exactly one live node for each remaining criterion.
+The commands and complete safe outcomes were:
+
+```bash
+timeout 210s uv run pytest -m real_qoder tests/integration/test_real_auditor_security.py::test_real_coder_edit_and_structured_validation_ac5 -q
+# 1 failed in 28.15s
+```
+
+AC5 fixed-boolean evidence: exact marker file `true`, disposable workspace had
+no `.git` directory `true`, resolved model `Qwen3.8-Max` `true`, actual model
+`Qwen3.8-Max` `true`, and credential exclusion `true`; completed result,
+reported `marker.txt`, and nonempty structured validation were all `false`.
+The coder therefore demonstrated a real edit but not the required validation
+report. The node was not retried.
+
+```bash
+timeout 210s uv run pytest -m real_qoder tests/integration/test_real_auditor_security.py::test_real_auditor_and_direct_helper_denials_ac6 -q
+# 1 failed in 91.35s
+```
+
+AC6 fixed-boolean evidence: workspace byte snapshot unchanged `true` and
+credential exclusion `true`. Observed denial callbacks for top-level and helper
+Write/Edit/Bash were all `false`; top-level Agent allow was also `false`, and
+the structured result did not complete. Because no callback was observed, the
+unchanged workspace cannot be presented as proof that the live auditor/helper
+were denied. The node was not retried.
+
+```bash
+timeout 210s uv run pytest -m real_qoder tests/integration/test_real_resume.py::test_real_normal_stop_preserves_edit_and_reaps_owned_child_ac11 -q
+# 1 failed in 9.09s
+```
+
+AC11 fixed-boolean evidence: running observed, non-forced stop, exited health,
+preserved workspace bytes, disappearance of the exact SDK-owned child identity,
+and credential exclusion were all `true`. The returned state was not
+`cancelled`, so the test's normal-cancel gate was `false`. No process scan or
+command-line read occurred: identity was limited to the SDK-owned PID, its
+parent PID, and start-time ticks from `/proc/<pid>/stat`. The node was not
+retried.
+
 ## Remaining acceptance work
 
-1. Expose bounded direct-subagent task telemetry through public watch/status and
-   persist a safe transcript locator that can be resolved after completion.
-2. Add a bounded real-Qoder coder edit in a disposable directory when separate
-   credit authorization is available.
-3. Add a live adversarial auditor/helper run that observes callback denials for
-   write and shell requests rather than inferring them from a cooperative prompt.
-4. During a live normal stop, identify the owned QoderCLI child and verify it no
-   longer exists without inspecting or exposing unrelated process arguments.
+1. Determine why the real coder completes its exact edit without returning the
+   required structured file/validation report; a future live retry needs fresh
+   explicit authorization.
+2. Determine why the installed QoderCLI does not issue the exposed adversarial
+   Write/Edit/Bash or Agent callbacks; a future live retry needs fresh explicit
+   authorization.
+3. Determine why the live non-forced stop returned a terminal state other than
+   `cancelled` despite exited health and owned-child disappearance; a future live
+   retry needs fresh explicit authorization.
+4. Revisit AC7 only if a later QoderCLI/SDK boundary supplies correlatable live
+   direct-helper telemetry and transcript discovery; its current waiver is not
+   acceptance evidence.
