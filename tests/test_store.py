@@ -212,9 +212,36 @@ async def test_store_rejects_sensitive_or_free_form_allowed_values(
     assert len(await store.events_since(worker.worker_id)) == 1
 
 
+async def test_create_worker_preserves_caller_workspace_with_spaced_segments(
+    tmp_path: Path,
+) -> None:
+    caller_cwd = tmp_path / "Caller Workspace" / "My Qoder Worker Project"
+    store = WorkerStore(tmp_path / "state")
+
+    worker = await store.create_worker(
+        role="coder",
+        cwd=caller_cwd,
+        write_capability="shared_workspace",
+        requested_model="qwen-coder",
+        runtime_path="bundled",
+        sdk_version="1.0.13",
+        worker_id="worker-1",
+    )
+
+    assert worker.cwd == caller_cwd
+    assert (await store.events_since(worker.worker_id))[0].payload == {
+        "schema_version": 1,
+        "attempt": 1,
+        "cwd": str(caller_cwd),
+        "role": "coder",
+    }
+
+
 @pytest.mark.parametrize(
     ("field", "invalid_value"),
     (
+        ("role", "sk-live-secret"),
+        ("write_capability", "sk-live-secret"),
         ("requested_model", "sk-live-secret"),
         ("runtime_path", "a raw runtime transcript"),
         ("runtime_version", "credential-value"),
@@ -243,6 +270,7 @@ async def test_create_worker_rejects_unsafe_ingress_without_persisting(
     with pytest.raises(ValueError, match="worker creation field"):
         await store.create_worker(**worker_arguments)  # type: ignore[arg-type]
 
+    assert not store.database_path.exists()
     assert await store.events_since("worker-1") == ()
     with sqlite3.connect(store.database_path) as connection:
         assert connection.execute("SELECT COUNT(*) FROM workers").fetchone() == (0,)

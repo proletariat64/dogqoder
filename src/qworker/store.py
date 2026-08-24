@@ -135,9 +135,7 @@ def _absolute_path(value: JsonValue) -> bool:
     ):
         return False
     return all(
-        not _contains_sensitive_marker(part) and len(part.split()) <= 2
-        for part in value.split("/")
-        if part
+        not _contains_sensitive_marker(part) for part in value.split("/") if part
     )
 
 
@@ -150,12 +148,14 @@ _CODE = _safe_metadata
 _MODEL = _safe_metadata
 _PATH = _absolute_path
 _RUNTIME_VERSION = _safe_runtime_version
+_ROLE = _one_of("coder", "auditor")
+_WRITE_CAPABILITY = _one_of("shared_workspace", "read_only")
 _EVENT_SCHEMAS: dict[str, _EventSchema] = {
     "worker.created": _EventSchema(
         required={
             "attempt": _positive_integer,
             "cwd": _PATH,
-            "role": _one_of("coder", "auditor"),
+            "role": _ROLE,
         },
         optional={},
     ),
@@ -276,7 +276,9 @@ class WorkerStore:
         canonical_cwd = cwd.resolve(strict=False)
         _validate_worker_creation(
             worker_id=worker_identifier,
+            role=role,
             cwd=canonical_cwd,
+            write_capability=write_capability,
             requested_model=requested_model,
             runtime_path=runtime_path,
             runtime_version=runtime_version,
@@ -710,7 +712,9 @@ def _validated_payload(
 def _validate_worker_creation(
     *,
     worker_id: str,
+    role: WorkerRole,
     cwd: Path,
+    write_capability: WriteCapability,
     requested_model: str,
     runtime_path: str,
     runtime_version: str | None,
@@ -720,7 +724,9 @@ def _validate_worker_creation(
 
     values: tuple[tuple[str, JsonValue, _PayloadValidator], ...] = (
         ("worker_id", worker_id, _IDENTIFIER),
+        ("role", role, _ROLE),
         ("cwd", str(cwd), _PATH),
+        ("write_capability", write_capability, _WRITE_CAPABILITY),
         ("requested_model", requested_model, _MODEL),
         ("runtime_path", runtime_path, _runtime_path),
         ("sdk_version", sdk_version, _RUNTIME_VERSION),
