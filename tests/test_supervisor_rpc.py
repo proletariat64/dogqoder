@@ -278,6 +278,25 @@ async def test_rpc_correlates_finite_requests_and_streams_ordered_watch(
     await supervisor.close()
 
 
+async def test_rpc_list_rejects_unexpected_fields(tmp_path: Path) -> None:
+    supervisor = Supervisor(
+        WorkerStore(tmp_path / "state"),
+        lambda _: FakeQoderTransport.successful_audit(),
+        sdk_version="1.0.13",
+    )
+    socket_path = tmp_path / "runtime" / "qworker.sock"
+    server = RPCServer(supervisor, socket_path)
+    await server.start()
+
+    with pytest.raises(RPCClientError) as raised:
+        await call(socket_path, "list", {"state": "running"})
+
+    assert raised.value.code == "invalid_request"
+    assert raised.value.message == "Unexpected field: state"
+    await server.close()
+    await supervisor.close()
+
+
 async def test_rpc_refuses_to_replace_an_active_supervisor_socket(
     tmp_path: Path,
 ) -> None:

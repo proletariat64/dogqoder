@@ -64,6 +64,14 @@ class EventRecord:
         return self.type
 
 
+@dataclass(frozen=True, slots=True)
+class ListedWorker:
+    """One durable worker and its latest event cursor for list projection."""
+
+    worker: WorkerRecord
+    event_cursor: int
+
+
 class AttemptChangedError(RuntimeError):
     """A conditional event write no longer targets its live attempt."""
 
@@ -791,6 +799,31 @@ class WorkerStore:
             "SELECT * FROM workers WHERE worker_id = ?", (worker_id,)
         ).fetchone()
         return _worker_from_row(row) if row is not None else None
+
+    async def list_workers(self) -> tuple[ListedWorker, ...]:
+        """Return every durable worker newest-first with its latest cursor."""
+
+        connection = self._open()
+        rows = connection.execute(
+            """
+            SELECT workers.*,
+                   COALESCE(
+                       (SELECT MAX(events.sequence)
+                        FROM events
+                        WHERE events.worker_id = workers.worker_id),
+                       0
+                   ) AS event_cursor
+            FROM workers
+            ORDER BY workers.created_at DESC, workers.worker_id DESC
+            """
+        ).fetchall()
+        return tuple(
+            ListedWorker(
+                worker=_worker_from_row(row),
+                event_cursor=cast(int, row["event_cursor"]),
+            )
+            for row in rows
+        )
 
     async def latest_event_cursor(self, worker_id: str) -> int:
         """Return the latest per-worker sequence without loading event history."""

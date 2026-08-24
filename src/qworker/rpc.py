@@ -213,6 +213,9 @@ class RPCServer:
                     acceptance_criteria=acceptance_criteria,
                 )
             return await self._supervisor.spawn(contract)
+        if method == "list":
+            _validate_fields(params, required=())
+            return await self._supervisor.list_workers()
         if method == "status":
             _validate_fields(params, required=("worker_id",))
             return await self._supervisor.status(_string(params, "worker_id"))

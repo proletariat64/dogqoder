@@ -65,6 +65,6 @@ def test_workflow_uses_json_only_and_discloses_exact_cli_contract() -> None:
         "Use files or stdin for prompts, specifications, steering messages, and "
         "approval responses; never place large content in command arguments."
     ) in skill
-    for command in ("spawn", "status", "watch", "result", "stop", "resume"):
+    for command in ("spawn", "list", "status", "watch", "result", "stop", "resume"):
         assert f"qworker {command}" in contract
     assert "Treat stdout as JSON or JSON Lines only" in contract

@@ -34,7 +34,13 @@ from qworker.preflight import (
     normalize_preflight_warnings,
     safe_preflight_failure,
 )
-from qworker.store import AttemptChangedError, EventRecord, JsonValue, WorkerStore
+from qworker.store import (
+    AttemptChangedError,
+    EventRecord,
+    JsonValue,
+    ListedWorker,
+    WorkerStore,
+)
 from qworker.transport import QoderTransport
 from qworker.workspace import canonical_workspace, classify_workspace_overlap
 
@@ -329,6 +335,15 @@ class Supervisor:
                 and worker.state == "requires_action"
             ]
             return status
+
+    async def list_workers(self) -> dict[str, JsonValue]:
+        """Return safe summaries for every durable worker newest-first."""
+
+        workers = await self._store.list_workers()
+        return {
+            "workers": [_listed_worker_json(item) for item in workers],
+            "count": len(workers),
+        }
 
     async def result(self, worker_id: str) -> dict[str, JsonValue] | None:
         """Return a durable structured result, or ``None`` while none exists."""
@@ -1175,6 +1190,25 @@ def _worker_json(worker: WorkerRecord, *, event_cursor: int) -> dict[str, JsonVa
         "nested_state": worker.nested_state,
         "warnings": list(worker.warnings),
         "event_cursor": event_cursor,
+    }
+
+
+def _listed_worker_json(item: ListedWorker) -> dict[str, JsonValue]:
+    worker = item.worker
+    return {
+        "worker_id": worker.worker_id,
+        "role": worker.role,
+        "cwd": str(worker.cwd),
+        "state": worker.state,
+        "health": worker.health,
+        "attempt": worker.attempt,
+        "write_capability": worker.write_capability,
+        "requested_model": worker.requested_model,
+        "resolved_model": worker.resolved_model,
+        "created_at": worker.created_at.isoformat(),
+        "ended_at": worker.ended_at.isoformat() if worker.ended_at else None,
+        "warnings": list(worker.warnings),
+        "event_cursor": item.event_cursor,
     }
 
 

@@ -7,7 +7,8 @@ the main Codex session to another provider.
 
 The current implementation provides a persistent local supervisor, stable JSON
 CLI, read-only auditors, shared-workspace coders, and a model-invoked Codex
-skill. Failure injection and final acceptance hardening remain planned.
+skill. Failure injection and V1 acceptance hardening are complete under the
+documented direct-subagent telemetry waiver.
 
 ## Goals
 
@@ -120,7 +121,7 @@ fallback once a coder may have touched the shared workspace.
 | --- | --- |
 | Worker ownership | One `QoderSDKClient` and QoderCLI process per live top-level worker |
 | Steering | SDK priorities `now`, `next`, and `later`; queued messages use UUIDs |
-| Nested visibility | Task events plus persisted Qoder subagent transcripts |
+| Nested visibility | Task events when emitted; current SDK/CLI cannot provide correlatable post-run direct-helper transcript discovery |
 | Nested control | Observe only; Python SDK 1.0.13 cannot steer or stop one selected nested agent |
 | Recovery | Explicit respawn with `resume=<session_id>` and the original cwd |
 | Auditor safety | Tool visibility, denylist, `dontAsk`, and fail-closed permission callback |
@@ -144,9 +145,9 @@ dogqoder/
 └── uv.lock
 ```
 
-The supervisor, persistence, RPC, JSON CLI, auditor and coder paths, and Codex
-skill now exist under `src/qworker`, `tests`, and `skills`. Later hardening and
-acceptance work will extend this structure.
+The supervisor, persistence, RPC, JSON CLI, auditor and coder paths, Codex
+skill, failure coverage, and V1 acceptance evidence now exist under
+`src/qworker`, `tests`, `skills`, and `docs/research`.
 
 ## Agent workflow
 
@@ -161,8 +162,8 @@ read README
 ```
 
 Completed tracer bullets cover initialization, model resolution, event
-reduction, durable supervision and control, explicit recovery, and structured
-auditor and coder completion. Remaining work hardens failures and collects final
+reduction, durable supervision and control, explicit recovery, structured
+auditor and coder completion, failure injection, and bounded real-Qoder
 acceptance evidence.
 
 ## Technical stack

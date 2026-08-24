@@ -12,6 +12,12 @@ bounded authorized markers. Acceptance criterion 7 is **Waived — QoderCLI
 limitation** by explicit user decision; the waiver records the unsupported
 boundary and is not a demonstration.
 
+Authentication scope uses `QODER_PERSONAL_ACCESS_TOKEN`. On 2026-08-25 the
+user explicitly excluded OAuth approval flows from V1 because this deployment
+authenticates with PAT rather than OAuth. Issue acceptance is evaluated against
+that superseding scope decision; qworker does not claim an OAuth approval
+workflow.
+
 This report distinguishes deterministic guarantees from live observations. A
 fake transport proves qworker behavior at its stable CLI/RPC/transport seams; it
 does not prove that the installed Qoder runtime emitted a particular live event

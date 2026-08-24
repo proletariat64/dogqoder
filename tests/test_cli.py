@@ -193,6 +193,95 @@ async def test_json_coder_spawn_uses_role_default_and_reports_overlap(
     await supervisor.close()
 
 
+async def test_json_list_returns_all_workers_newest_first_without_results(
+    tmp_path: Path,
+) -> None:
+    gates = (asyncio.Event(), asyncio.Event())
+    transports = iter(
+        (
+            GatedFakeQoderTransport(gates[0], session_id="list-session-1"),
+            GatedFakeQoderTransport(gates[1], session_id="list-session-2"),
+        )
+    )
+    supervisor = Supervisor(
+        WorkerStore(tmp_path / "state"),
+        lambda _: next(transports),
+        sdk_version="1.0.13",
+    )
+    socket_path = tmp_path / "runtime" / "qworker.sock"
+    server = RPCServer(supervisor, socket_path)
+    await server.start()
+
+    empty_stdout = StringIO()
+    empty_exit = await run(
+        ["--socket", str(socket_path), "list", "--json"],
+        stdin=StringIO(),
+        stdout=empty_stdout,
+    )
+    assert empty_exit == 0
+    assert json.loads(empty_stdout.getvalue()) == {"workers": [], "count": 0}
+
+    async def spawn(objective: str) -> dict[str, object]:
+        stdout = StringIO()
+        exit_code = await run(
+            [
+                "--socket",
+                str(socket_path),
+                "spawn",
+                "--role",
+                "auditor",
+                "--cwd",
+                str(tmp_path),
+                "--json",
+            ],
+            stdin=StringIO(objective),
+            stdout=stdout,
+        )
+        assert exit_code == 0
+        result = json.loads(stdout.getvalue())
+        assert isinstance(result, dict)
+        return result
+
+    first = await spawn("first listed worker")
+    second = await spawn("second listed worker")
+    stdout = StringIO()
+    exit_code = await run(
+        ["--socket", str(socket_path), "list", "--json"],
+        stdin=StringIO(),
+        stdout=stdout,
+    )
+
+    output = json.loads(stdout.getvalue())
+    assert exit_code == 0
+    assert output["count"] == 2
+    workers = output["workers"]
+    assert [worker["worker_id"] for worker in workers] == [
+        second["worker_id"],
+        first["worker_id"],
+    ]
+    assert set(workers[0]) == {
+        "worker_id",
+        "role",
+        "cwd",
+        "state",
+        "health",
+        "attempt",
+        "write_capability",
+        "requested_model",
+        "resolved_model",
+        "created_at",
+        "ended_at",
+        "warnings",
+        "event_cursor",
+    }
+    assert workers[0]["role"] == "auditor"
+    assert workers[0]["cwd"] == str(tmp_path)
+    assert workers[0]["event_cursor"] >= 1
+
+    await server.close()
+    await supervisor.close()
+
+
 async def test_qworker_console_entrypoint_emits_json_connection_error(
     tmp_path: Path,
 ) -> None:

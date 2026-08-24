@@ -69,6 +69,10 @@ async def run(
             )
             _write_json(stdout, result)
             return 0
+        if arguments.command == "list":
+            result = await call(socket_path, "list", {})
+            _write_json(stdout, result)
+            return 0
         if arguments.command == "status":
             result = await call(
                 socket_path,
@@ -220,6 +224,9 @@ def _parser() -> _ArgumentParser:
     spawn.add_argument("--spec-file", type=Path)
     spawn.add_argument("--no-start-supervisor", action="store_true")
     spawn.add_argument("--json", action="store_true")
+
+    list_parser = commands.add_parser("list")
+    list_parser.add_argument("--json", action="store_true")
 
     status = commands.add_parser("status")
     status.add_argument("worker_id")

@@ -75,6 +75,48 @@ async def test_store_round_trips_workers_attempts_and_ordered_events(
         assert connection.execute("PRAGMA journal_mode").fetchone() == ("wal",)
 
 
+async def test_store_lists_persisted_workers_newest_first_with_cursors(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    store = WorkerStore(state_dir)
+    assert await store.list_workers() == ()
+    first = await store.create_worker(
+        role="auditor",
+        cwd=tmp_path,
+        write_capability="read_only",
+        requested_model="qwen-auditor",
+        runtime_path="bundled",
+        sdk_version="1.0.13",
+        worker_id="00000000000000000000000001",
+    )
+    await store.append_event(
+        first.worker_id,
+        "model.resolved",
+        {"schema_version": 1, "model": "Qwen3.8-Max"},
+    )
+    second = await store.create_worker(
+        role="coder",
+        cwd=tmp_path,
+        write_capability="shared_workspace",
+        requested_model="qwen-coder",
+        runtime_path="bundled",
+        sdk_version="1.0.13",
+        worker_id="00000000000000000000000002",
+    )
+    await store.close()
+
+    reopened = WorkerStore(state_dir)
+    listed = await reopened.list_workers()
+
+    assert [item.worker.worker_id for item in listed] == [
+        second.worker_id,
+        first.worker_id,
+    ]
+    assert [item.event_cursor for item in listed] == [1, 2]
+    await reopened.close()
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX mode bits are required")
 async def test_store_creates_private_state_directory_and_database(
     tmp_path: Path,

@@ -24,6 +24,19 @@ qworker spawn --role ROLE --cwd CWD --model MODEL --spec-file SPEC_FILE --json
 
 Omitting `--spec-file` reads the specification from stdin. Acceptance returns a JSON object containing `worker_id`, initial `state`, `role`, canonical `cwd`, and `event_cursor`; it may also contain `warnings`. Retain the ID and cursor. For a coder, inspect shared-workspace overlap warnings before introducing any other writer.
 
+## Enumerate
+
+```text
+qworker list --json
+```
+
+The response contains `workers` and `count`. `workers` includes every persisted
+worker newest-first. Each summary contains worker ID, role, canonical cwd,
+lifecycle state, health, attempt, write capability, requested and resolved
+models, creation and end timestamps, warnings, and latest event cursor. List
+summaries exclude result bodies and session IDs; use `status` or `result` for
+one worker's details.
+
 ## Observe
 
 ```text

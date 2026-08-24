@@ -31,11 +31,12 @@ For exact commands, response fields, lifecycle states, and recovery limits, read
 
 1. Write a focused worker specification containing role, objective, absolute workspace, relevant context, constraints, acceptance criteria, and required report fields.
 2. Use files or stdin for prompts, specifications, steering messages, and approval responses; never place large content in command arguments.
-3. Run `spawn --json`. Inspect its JSON response and retain `worker_id`, `state`, `event_cursor`, and warnings. An accepted coder is now a possible workspace writer.
-4. Use `status --json` for a snapshot and `watch --json` from the last cursor for ordered updates. Parse each JSON value; treat warnings, pending approvals, health, and lifecycle state as separate signals.
-5. On a terminal state, use `result --json` and report its outcome, summary, files, validation, risks, actual models, nested state, warnings, and errors.
-6. Use `stop --json` when execution should end. Existing coder edits remain in the shared workspace.
-7. Use `resume --json` only for an eligible lost, failed, or cancelled worker with a stored session. Recheck the original workspace first, then monitor the new attempt as a fresh process.
+3. Use `list --json` to discover every persisted worker before deciding whether a new worker is needed.
+4. Run `spawn --json`. Inspect its JSON response and retain `worker_id`, `state`, `event_cursor`, and warnings. An accepted coder is now a possible workspace writer.
+5. Use `status --json` for a snapshot and `watch --json` from the last cursor for ordered updates. Parse each JSON value; treat warnings, pending approvals, health, and lifecycle state as separate signals.
+6. On a terminal state, use `result --json` and report its outcome, summary, files, validation, risks, actual models, nested state, warnings, and errors.
+7. Use `stop --json` when execution should end. Existing coder edits remain in the shared workspace.
+8. Use `resume --json` only for an eligible lost, failed, or cancelled worker with a stored session. Recheck the original workspace first, then monitor the new attempt as a fresh process.
 
 ## Apply fallback policy
 
