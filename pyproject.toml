@@ -8,6 +8,13 @@ dependencies = [
     "qoder-agent-sdk==1.0.13",
 ]
 
+[project.scripts]
+qworker = "qworker.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13"]
+build-backend = "uv_build"
+
 [dependency-groups]
 dev = [
     "mypy",
@@ -17,7 +24,10 @@ dev = [
 ]
 
 [tool.uv]
-package = false
+package = true
+
+[tool.uv.build-backend]
+module-name = "qworker"
 
 [tool.pytest.ini_options]
 addopts = "-m 'not real_qoder'"

@@ -10,7 +10,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 from qworker.lifecycle import (
     AttemptRecord,
@@ -436,6 +436,77 @@ class WorkerStore:
                 timestamp=_utc_now(),
             )
             self._project_event(connection, event)
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        return event
+
+    async def record_result(
+        self,
+        worker_id: str,
+        *,
+        outcome: Literal["completed", "partial", "blocked", "failed"],
+        result_summary: Mapping[str, JsonValue],
+        resolved_model: str | None,
+        actual_models: tuple[str, ...],
+        session_id: str | None,
+        nested_state: NestedState,
+        warnings: tuple[str, ...],
+    ) -> EventRecord:
+        """Persist a structured result and its semantic event in one transaction."""
+
+        safe_result = _copy_json_object(result_summary)
+        if resolved_model is not None and not _MODEL(resolved_model):
+            raise ValueError("Unsafe worker result field: resolved_model")
+        if any(not _MODEL(model) for model in actual_models):
+            raise ValueError("Unsafe worker result field: actual_models")
+        if session_id is not None and not _IDENTIFIER(session_id):
+            raise ValueError("Unsafe worker result field: session_id")
+        if nested_state not in ("none", "active", "settled", "unknown"):
+            raise ValueError("Unsafe worker result field: nested_state")
+        if any(not _CODE(warning) for warning in warnings):
+            raise ValueError("Unsafe worker result field: warnings")
+
+        connection = self._open()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT attempt FROM workers WHERE worker_id = ?", (worker_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown worker: {worker_id}")
+            payload: dict[str, JsonValue] = {
+                "schema_version": _EVENT_SCHEMA_VERSION,
+                "outcome": outcome,
+            }
+            if resolved_model is not None:
+                payload["model"] = resolved_model
+            event = self._append_event(
+                connection,
+                worker_id=worker_id,
+                attempt=int(row["attempt"]),
+                event_type="result.received",
+                payload=payload,
+                timestamp=_utc_now(),
+            )
+            connection.execute(
+                """
+                UPDATE workers
+                SET result_summary = ?, resolved_model = ?, actual_models = ?,
+                    session_id = ?, nested_state = ?, warnings = ?
+                WHERE worker_id = ?
+                """,
+                (
+                    json.dumps(safe_result, separators=(",", ":"), sort_keys=True),
+                    resolved_model,
+                    json.dumps(actual_models, separators=(",", ":")),
+                    session_id,
+                    nested_state,
+                    json.dumps(warnings, separators=(",", ":")),
+                    worker_id,
+                ),
+            )
             connection.commit()
         except BaseException:
             connection.rollback()

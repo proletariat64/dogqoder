@@ -1,0 +1,306 @@
+import asyncio
+import json
+import os
+from collections.abc import AsyncIterator
+from pathlib import Path
+
+import pytest
+
+from qworker.domain import AuditContract
+from qworker.events import AdapterEvent, ResultEvent
+from qworker.model_policy import AvailableModel
+from qworker.rpc import RPCServer
+from qworker.store import JsonValue, WorkerStore
+from qworker.supervisor import Supervisor
+from tests.fakes import SUCCESSFUL_AUDIT_REPORT, FakeQoderTransport
+
+
+class GatedFakeQoderTransport(FakeQoderTransport):
+    """Fake transport whose result remains pending until a test releases it."""
+
+    def __init__(self, gate: asyncio.Event, *, session_id: str) -> None:
+        super().__init__(
+            models=(AvailableModel(value="Qwen3.8-Max", enabled=True),),
+            events=(
+                ResultEvent(
+                    session_id=session_id,
+                    is_error=False,
+                    result=SUCCESSFUL_AUDIT_REPORT,
+                    model_usage=("Qwen3.8-Max",),
+                ),
+            ),
+        )
+        self._gate = gate
+
+    async def messages(self) -> AsyncIterator[AdapterEvent]:
+        await self._gate.wait()
+        async for event in super().messages():
+            yield event
+
+
+async def test_spawn_returns_stable_id_before_durable_completion(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    gate = asyncio.Event()
+    transport = GatedFakeQoderTransport(gate, session_id="session-1")
+    supervisor = Supervisor(
+        WorkerStore(state_dir),
+        lambda _: transport,
+        sdk_version="1.0.13",
+    )
+
+    accepted = await supervisor.spawn(
+        AuditContract(objective="audit task six", cwd=tmp_path)
+    )
+    worker_id = accepted["worker_id"]
+    assert isinstance(worker_id, str)
+
+    assert accepted == {
+        "worker_id": worker_id,
+        "state": "starting",
+        "role": "auditor",
+        "cwd": str(tmp_path),
+        "event_cursor": 1,
+    }
+    assert (await supervisor.status(worker_id))["state"] == "starting"
+    assert await supervisor.result(worker_id) is None
+
+    gate.set()
+    terminal = [
+        event async for event in supervisor.watch(worker_id, since=0, follow=True)
+    ]
+    result = await supervisor.result(worker_id)
+
+    assert [event["sequence"] for event in terminal] == [1, 2, 3, 4, 5, 6]
+    assert [event["type"] for event in terminal] == [
+        "worker.created",
+        "worker.state_changed",
+        "worker.health_changed",
+        "model.resolved",
+        "result.received",
+        "worker.state_changed",
+    ]
+    assert result is not None
+    assert result["outcome"] == "completed"
+    assert result["summary"] == "safe"
+    assert result["session_id"] == "session-1"
+    assert result["nested_state"] == "settled"
+
+    await supervisor.close()
+    reopened = Supervisor(
+        WorkerStore(state_dir),
+        lambda _: transport,
+        sdk_version="1.0.13",
+    )
+    assert await reopened.result(worker_id) == result
+    assert (await reopened.status(worker_id))["state"] == "completed"
+    await reopened.close()
+
+
+async def _write_request(
+    writer: asyncio.StreamWriter, request: dict[str, object]
+) -> None:
+    writer.write(json.dumps(request).encode() + b"\n")
+    await writer.drain()
+
+
+async def _read_response(reader: asyncio.StreamReader) -> dict[str, object]:
+    line = await asyncio.wait_for(reader.readline(), timeout=1)
+    assert line
+    response = json.loads(line)
+    assert isinstance(response, dict)
+    return response
+
+
+async def test_rpc_correlates_finite_requests_and_streams_ordered_watch(
+    tmp_path: Path,
+) -> None:
+    gate = asyncio.Event()
+    supervisor = Supervisor(
+        WorkerStore(tmp_path / "state"),
+        lambda _: GatedFakeQoderTransport(gate, session_id="session-rpc"),
+        sdk_version="1.0.13",
+    )
+    socket_path = tmp_path / "runtime" / "qworker.sock"
+    server = RPCServer(supervisor, socket_path)
+    await server.start()
+
+    reader, writer = await asyncio.open_unix_connection(socket_path)
+    await _write_request(
+        writer,
+        {
+            "request_id": "request-spawn",
+            "method": "spawn",
+            "params": {
+                "role": "auditor",
+                "cwd": str(tmp_path),
+                "model": "qwen-auditor",
+                "objective": "audit rpc",
+            },
+        },
+    )
+    spawn_response = await _read_response(reader)
+    assert spawn_response["request_id"] == "request-spawn"
+    assert spawn_response["ok"] is True
+    accepted = spawn_response["result"]
+    assert isinstance(accepted, dict)
+    worker_id = accepted["worker_id"]
+    assert isinstance(worker_id, str)
+
+    await _write_request(
+        writer,
+        {
+            "request_id": "request-status",
+            "method": "status",
+            "params": {"worker_id": worker_id},
+        },
+    )
+    status_response = await _read_response(reader)
+    assert status_response["request_id"] == "request-status"
+    assert status_response["ok"] is True
+    writer.close()
+    await writer.wait_closed()
+
+    await asyncio.sleep(0)
+    watch_reader, watch_writer = await asyncio.open_unix_connection(socket_path)
+    await _write_request(
+        watch_writer,
+        {
+            "request_id": "request-watch",
+            "method": "watch",
+            "params": {"worker_id": worker_id, "since": 3, "follow": True},
+        },
+    )
+    initial = await _read_response(watch_reader)
+    assert initial == {
+        "request_id": "request-watch",
+        "ok": True,
+        "result": {"worker_id": worker_id, "since": 3, "follow": True},
+    }
+
+    gate.set()
+    streamed = [await _read_response(watch_reader) for _ in range(3)]
+    assert [response["request_id"] for response in streamed] == [
+        "request-watch",
+        "request-watch",
+        "request-watch",
+    ]
+    assert [response["result"]["event"]["sequence"] for response in streamed] == [  # type: ignore[index]
+        4,
+        5,
+        6,
+    ]
+    assert await asyncio.wait_for(watch_reader.readline(), timeout=1) == b""
+    watch_writer.close()
+    await watch_writer.wait_closed()
+
+    if os.name == "posix":
+        assert socket_path.parent.stat().st_mode & 0o777 == 0o700
+        assert socket_path.stat().st_mode & 0o777 == 0o600
+
+    await server.close()
+    await supervisor.close()
+
+
+async def test_rpc_refuses_to_replace_an_active_supervisor_socket(
+    tmp_path: Path,
+) -> None:
+    gate = asyncio.Event()
+    supervisor = Supervisor(
+        WorkerStore(tmp_path / "state"),
+        lambda _: GatedFakeQoderTransport(gate, session_id="session-owner"),
+        sdk_version="1.0.13",
+    )
+    socket_path = tmp_path / "runtime" / "qworker.sock"
+    owner = RPCServer(supervisor, socket_path)
+    contender = RPCServer(supervisor, socket_path)
+    await owner.start()
+
+    with pytest.raises(RuntimeError, match="already active"):
+        await contender.start()
+
+    reader, writer = await asyncio.open_unix_connection(socket_path)
+    await _write_request(
+        writer,
+        {
+            "request_id": "owner-check",
+            "method": "status",
+            "params": {"worker_id": "missing-worker"},
+        },
+    )
+    response = await _read_response(reader)
+    assert response["request_id"] == "owner-check"
+    error = response["error"]
+    assert isinstance(error, dict)
+    assert error["code"] == "worker_not_found"
+    writer.close()
+    await writer.wait_closed()
+
+    await owner.close()
+    await supervisor.close()
+
+
+async def test_two_workers_follow_independent_reconnecting_cursors(
+    tmp_path: Path,
+) -> None:
+    first_gate = asyncio.Event()
+    second_gate = asyncio.Event()
+    transports = iter(
+        (
+            GatedFakeQoderTransport(first_gate, session_id="session-1"),
+            GatedFakeQoderTransport(second_gate, session_id="session-2"),
+        )
+    )
+    supervisor = Supervisor(
+        WorkerStore(tmp_path / "state"),
+        lambda _: next(transports),
+        sdk_version="1.0.13",
+    )
+    first = await supervisor.spawn(
+        AuditContract(objective="audit first worker", cwd=tmp_path)
+    )
+    second = await supervisor.spawn(
+        AuditContract(objective="audit second worker", cwd=tmp_path)
+    )
+    await asyncio.sleep(0)
+
+    first_replay = [
+        event
+        async for event in supervisor.watch(
+            str(first["worker_id"]), since=0, follow=False
+        )
+    ]
+    second_replay = [
+        event
+        async for event in supervisor.watch(
+            str(second["worker_id"]), since=0, follow=False
+        )
+    ]
+    assert [event["sequence"] for event in first_replay] == [1, 2, 3]
+    assert [event["sequence"] for event in second_replay] == [1, 2, 3]
+
+    async def reconnect(worker_id: str) -> list[dict[str, JsonValue]]:
+        return [
+            event async for event in supervisor.watch(worker_id, since=3, follow=True)
+        ]
+
+    first_watch = asyncio.create_task(reconnect(str(first["worker_id"])))
+    second_watch = asyncio.create_task(reconnect(str(second["worker_id"])))
+    await asyncio.sleep(0)
+    first_gate.set()
+    second_gate.set()
+    first_tail, second_tail = await asyncio.gather(first_watch, second_watch)
+
+    assert [event["sequence"] for event in first_tail] == [4, 5, 6]
+    assert [event["sequence"] for event in second_tail] == [4, 5, 6]
+    assert {event["worker_id"] for event in first_tail} == {first["worker_id"]}
+    assert {event["worker_id"] for event in second_tail} == {second["worker_id"]}
+    first_result = await supervisor.result(str(first["worker_id"]))
+    second_result = await supervisor.result(str(second["worker_id"]))
+    assert first_result is not None
+    assert second_result is not None
+    assert first_result["session_id"] == "session-1"
+    assert second_result["session_id"] == "session-2"
+
+    await supervisor.close()
