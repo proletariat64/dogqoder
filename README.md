@@ -5,8 +5,9 @@ Codex continues using its native OpenAI provider. It is designed for work that
 benefits from Qoder's model catalog—especially `Qwen3.8-Max`—without switching
 the main Codex session to another provider.
 
-The first tracer bullet now runs a foreground, read-only Qoder auditor end to
-end. The production supervisor and CLI are the next implementation work.
+The current implementation provides a persistent local supervisor, stable JSON
+CLI, read-only auditors, shared-workspace coders, and a model-invoked Codex
+skill. Failure injection and final acceptance hardening remain planned.
 
 ## Goals
 
@@ -50,6 +51,8 @@ to or continue an interrupted process.
 | --- | --- |
 | [`docs/superpowers/specs/2026-08-24-qoder-worker-design.md`](docs/superpowers/specs/2026-08-24-qoder-worker-design.md) | Normative V1 architecture, contracts, lifecycle, security, tests, and acceptance criteria |
 | [`docs/research/2026-08-24-qoder-sdk-feasibility.md`](docs/research/2026-08-24-qoder-sdk-feasibility.md) | Results from the real SDK/Qwen feasibility audit and the corrections it forced |
+| [`skills/qoder-worker/SKILL.md`](skills/qoder-worker/SKILL.md) | Model-invoked Codex policy for selecting, starting, observing, and recovering Qoder workers |
+| [`skills/qoder-worker/references/contract.md`](skills/qoder-worker/references/contract.md) | Stable JSON-only `qworker` command and lifecycle reference used by the skill |
 | [`spikes/qoder_audit_probe.py`](spikes/qoder_audit_probe.py) | Read-only executable probe that starts a Qoder auditor and observes its direct subagent |
 | [`HANDOFF.md`](HANDOFF.md) | Copy-ready prompt for continuing implementation in a fresh Codex session |
 
@@ -101,6 +104,16 @@ value to repository configuration, then opt in explicitly:
 uv run pytest tests/integration/test_real_qoder_auditor.py -m real_qoder -q
 ```
 
+## Codex worker skill
+
+The model-invoked [`qoder-worker` skill](skills/qoder-worker/SKILL.md) maps
+explicit delegation and eligible proactive work to the public `qworker` CLI.
+Review and verification intent selects a read-only auditor, implementation
+intent selects a coder, and ambiguity stays read-only. Independent audits may
+activate proactively; proactive coding requires effective project policy to
+enable it. All lifecycle interaction consumes JSON, with mutation-aware
+fallback once a coder may have touched the shared workspace.
+
 ## Core mechanisms
 
 | Mechanism | V1 behavior |
@@ -120,6 +133,7 @@ uv run pytest tests/integration/test_real_qoder_auditor.py -m real_qoder -q
 ```text
 dogqoder/
 ├── src/qworker/           # CLI, supervisor, domain model, SDK adapter
+├── skills/qoder-worker/   # Codex policy plus disclosed CLI contract
 ├── tests/                 # Unit, adapter-contract, and integration tests
 ├── docs/research/         # Empirical SDK findings
 ├── docs/superpowers/specs/# Accepted design specifications
@@ -130,9 +144,9 @@ dogqoder/
 └── uv.lock
 ```
 
-Tracer Bullet 1 implementation and tests now exist under `src/qworker` and
-`tests`. Later supervisor, persistence, RPC, and core CLI tracer bullets remain
-planned and will extend this structure.
+The supervisor, persistence, RPC, JSON CLI, auditor and coder paths, and Codex
+skill now exist under `src/qworker`, `tests`, and `skills`. Later hardening and
+acceptance work will extend this structure.
 
 ## Agent workflow
 
@@ -146,9 +160,10 @@ read README
 → verify every acceptance criterion
 ```
 
-The first tracer bullet is a foreground, single-worker, read-only auditor using
-the public SDK. It proves initialization, model resolution, event reduction, and
-structured completion; the daemon and full CLI remain planned.
+Completed tracer bullets cover initialization, model resolution, event
+reduction, durable supervision and control, explicit recovery, and structured
+auditor and coder completion. Remaining work hardens failures and collects final
+acceptance evidence.
 
 ## Technical stack
 
