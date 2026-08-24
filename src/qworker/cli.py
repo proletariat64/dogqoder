@@ -75,6 +75,61 @@ async def run(
             async for event in watch(socket_path, watch_params):
                 _write_json(stdout, event)
             return 0
+        if arguments.command == "steer":
+            message = _read_required_text(
+                cast(Path | None, arguments.message_file),
+                stdin,
+                label="steering message",
+            )
+            steer_params: dict[str, JsonValue] = {
+                "worker_id": cast(str, arguments.worker_id),
+                "message": message,
+                "priority": cast(str, arguments.priority),
+            }
+            agent_id = cast(str | None, arguments.agent_id)
+            if agent_id is not None:
+                steer_params["agent_id"] = agent_id
+            result = await call(socket_path, "steer", steer_params)
+            _write_json(stdout, result)
+            return 0
+        if arguments.command == "cancel-message":
+            result = await call(
+                socket_path,
+                "cancel_message",
+                {
+                    "worker_id": cast(str, arguments.worker_id),
+                    "message_id": cast(str, arguments.message_id),
+                },
+            )
+            _write_json(stdout, result)
+            return 0
+        if arguments.command == "respond":
+            raw_response = _read_required_text(
+                cast(Path | None, arguments.response_file),
+                stdin,
+                label="approval response",
+            )
+            try:
+                decoded: object = json.loads(raw_response)
+            except json.JSONDecodeError:
+                raise _ValidationError(
+                    "approval response must be one JSON object"
+                ) from None
+            if not isinstance(decoded, dict) or not all(
+                isinstance(key, str) for key in decoded
+            ):
+                raise _ValidationError("approval response must be one JSON object")
+            result = await call(
+                socket_path,
+                "respond",
+                {
+                    "worker_id": cast(str, arguments.worker_id),
+                    "request_id": cast(str, arguments.request_id),
+                    "response": cast(dict[str, JsonValue], decoded),
+                },
+            )
+            _write_json(stdout, result)
+            return 0
         raise _ValidationError("a command is required")
     except _ValidationError as error:
         _write_error(stdout, "invalid_request", str(error))
@@ -136,21 +191,50 @@ def _parser() -> _ArgumentParser:
     watch_parser.add_argument("--since", type=int, default=0)
     watch_parser.add_argument("--follow", action="store_true")
     watch_parser.add_argument("--json", action="store_true")
+
+    steer = commands.add_parser("steer")
+    steer.add_argument("worker_id")
+    steer.add_argument(
+        "--priority", choices=("now", "next", "later"), default="next"
+    )
+    steer.add_argument("--message-file", type=Path)
+    steer.add_argument("--agent-id")
+    steer.add_argument("--json", action="store_true")
+
+    cancel_message = commands.add_parser("cancel-message")
+    cancel_message.add_argument("worker_id")
+    cancel_message.add_argument("message_id")
+    cancel_message.add_argument("--json", action="store_true")
+
+    respond = commands.add_parser("respond")
+    respond.add_argument("worker_id")
+    respond.add_argument("request_id")
+    respond.add_argument("--response-file", type=Path)
+    respond.add_argument("--json", action="store_true")
     return parser
 
 
 def _read_objective(spec_file: Path | None, stdin: TextIO) -> str:
+    return _read_required_text(spec_file, stdin, label="spawn specification")
+
+
+def _read_required_text(
+    input_file: Path | None,
+    stdin: TextIO,
+    *,
+    label: str,
+) -> str:
     try:
-        objective = (
-            spec_file.read_text(encoding="utf-8")
-            if spec_file is not None
+        value = (
+            input_file.read_text(encoding="utf-8")
+            if input_file is not None
             else stdin.read()
         )
     except OSError:
-        raise _ValidationError("unable to read spawn specification") from None
-    if not objective.strip():
-        raise _ValidationError("spawn specification must not be empty")
-    return objective
+        raise _ValidationError(f"unable to read {label}") from None
+    if not value.strip():
+        raise _ValidationError(f"{label} must not be empty")
+    return value
 
 
 async def _spawn(

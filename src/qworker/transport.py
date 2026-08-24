@@ -3,6 +3,7 @@
 from collections.abc import AsyncIterator
 from typing import Protocol
 
+from qworker.control import ControlCallbacks, SteeringPriority
 from qworker.events import AdapterEvent
 from qworker.model_policy import AvailableModel
 
@@ -17,6 +18,18 @@ class QoderTransport(Protocol):
     async def select_model(self, model: str) -> None: ...
 
     async def send(self, prompt: str) -> None: ...
+
+    def bind_control(self, callbacks: ControlCallbacks) -> None: ...
+
+    async def steer(
+        self,
+        message: str,
+        *,
+        priority: SteeringPriority,
+        message_id: str,
+    ) -> None: ...
+
+    async def cancel_message(self, message_id: str) -> bool: ...
 
     def messages(self) -> AsyncIterator[AdapterEvent]: ...
 

@@ -14,6 +14,7 @@ from importlib.metadata import version
 from pathlib import Path
 from typing import cast
 
+from qworker.control import SteeringPriority
 from qworker.domain import AuditContract
 from qworker.store import JsonValue
 from qworker.supervisor import Supervisor, SupervisorError
@@ -188,6 +189,43 @@ class RPCServer:
         if method == "result":
             _validate_fields(params, required=("worker_id",))
             return await self._supervisor.result(_string(params, "worker_id"))
+        if method == "steer":
+            _validate_fields(
+                params,
+                required=("worker_id", "message"),
+                optional=("priority", "agent_id"),
+            )
+            priority = _optional_string(params, "priority", default="next")
+            if priority not in ("now", "next", "later"):
+                raise ValueError("priority must be now, next, or later.")
+            agent_id = (
+                _string(params, "agent_id") if "agent_id" in params else None
+            )
+            return await self._supervisor.steer(
+                _string(params, "worker_id"),
+                _string(params, "message"),
+                priority=cast(SteeringPriority, priority),
+                agent_id=agent_id,
+            )
+        if method == "cancel_message":
+            _validate_fields(params, required=("worker_id", "message_id"))
+            return await self._supervisor.cancel_message(
+                _string(params, "worker_id"),
+                _string(params, "message_id"),
+            )
+        if method == "respond":
+            _validate_fields(
+                params,
+                required=("worker_id", "request_id", "response"),
+            )
+            response = params["response"]
+            if not isinstance(response, dict):
+                raise TypeError("response must be a JSON object.")
+            return await self._supervisor.respond(
+                _string(params, "worker_id"),
+                _string(params, "request_id"),
+                response,
+            )
         raise ValueError(f"Unknown RPC method: {method}")
 
     async def _stream_watch(

@@ -40,8 +40,22 @@ from qoder_agent_sdk import (
     ToolUseBlock,
     access_token_from_env,
 )
+from qoder_agent_sdk import (
+    ElicitationRequest as SDKElicitationRequest,
+)
+from qoder_agent_sdk import (
+    ElicitationResult as SDKElicitationResult,
+)
 
 from qworker.auditor_policy import AuditorToolPolicy
+from qworker.control import (
+    ControlCallbacks,
+    ElicitationDecision,
+    ElicitationRequest,
+    PermissionDecision,
+    PermissionRequest,
+    SteeringPriority,
+)
 from qworker.events import (
     AdapterEvent,
     AssistantEvent,
@@ -137,6 +151,8 @@ type SDKOperation = Literal[
     "model_discovery",
     "model_selection",
     "query",
+    "steer",
+    "cancel_message",
     "stream",
     "disconnect",
 ]
@@ -183,7 +199,17 @@ class _SDKClient(Protocol):
 
     async def set_model(self, model: str | None = None) -> None: ...
 
-    async def query(self, prompt: str) -> None: ...
+    async def query(
+        self,
+        prompt: str,
+        session_id: str = "default",
+        *,
+        priority: SteeringPriority = "next",
+        message_uuid: str | None = None,
+        should_query: bool = True,
+    ) -> None: ...
+
+    async def cancel_async_message(self, message_uuid: str) -> bool: ...
 
     def receive_messages(self) -> AsyncIterator[object]: ...
 
@@ -197,6 +223,7 @@ class QoderSDKTransport:
         self._client = cast(_SDKClient, client)
         self._credential_values = _direct_credential_values(client)
         self._model_identifiers: dict[str, str] = {}
+        self._control_callbacks: ControlCallbacks | None = None
 
     async def connect(self) -> None:
         await _call_sdk(
@@ -248,6 +275,99 @@ class QoderSDKTransport:
         await _call_sdk(
             lambda: self._client.query(prompt),
             operation="query",
+            credential_values=self._credential_values,
+        )
+
+    def bind_control(self, callbacks: ControlCallbacks) -> None:
+        """Bind supervisor callbacks before the SDK client connects."""
+
+        self._control_callbacks = callbacks
+        options = getattr(self._client, "options", None)
+        if not isinstance(options, QoderAgentOptions):
+            raise AdapterDiagnostic(
+                "sdk_protocol_error",
+                "SDK client does not expose mutable control options.",
+            )
+        policy_callback = options.can_use_tool
+
+        async def can_use_tool(
+            tool_name: str,
+            tool_input: dict[str, Any],
+            context: ToolPermissionContext,
+        ) -> PermissionResultAllow | PermissionResultDeny:
+            if policy_callback is None:
+                return PermissionResultDeny(
+                    message="Tool permission policy is unavailable."
+                )
+            policy_decision = await policy_callback(tool_name, tool_input, context)
+            if isinstance(policy_decision, PermissionResultDeny):
+                return policy_decision
+            display_message = (
+                context.title
+                or context.display_name
+                or context.description
+                or f"Permission requested for {tool_name}."
+            )
+            try:
+                decision = await callbacks.request_permission(
+                    PermissionRequest(
+                        tool_name=tool_name,
+                        agent_id=context.agent_id,
+                        display_message=display_message,
+                    )
+                )
+            except Exception:  # noqa: BLE001 -- callback failures deny permission
+                decision = PermissionDecision("deny")
+            if decision.action == "allow":
+                return PermissionResultAllow(updated_input=tool_input)
+            return PermissionResultDeny(
+                message="Permission denied by supervisor response."
+            )
+
+        async def on_elicitation(
+            request: SDKElicitationRequest,
+        ) -> SDKElicitationResult:
+            mode = request.get("mode", "form")
+            safe_mode = mode if mode in ("form", "url") else "form"
+            try:
+                decision = await callbacks.request_elicitation(
+                    ElicitationRequest(
+                        server_name=request["serverName"],
+                        mode=safe_mode,
+                        display_message=request["message"],
+                    )
+                )
+            except Exception:  # noqa: BLE001 -- callback failures cancel elicitation
+                decision = ElicitationDecision("cancel")
+            result: SDKElicitationResult = {"action": decision.action}
+            if decision.action == "accept" and decision.content is not None:
+                result["content"] = cast(dict[str, Any], decision.content)
+            return result
+
+        options.can_use_tool = can_use_tool
+        options.on_elicitation = on_elicitation
+
+    async def steer(
+        self,
+        message: str,
+        *,
+        priority: SteeringPriority,
+        message_id: str,
+    ) -> None:
+        await _call_sdk(
+            lambda: self._client.query(
+                message,
+                priority=priority,
+                message_uuid=message_id,
+            ),
+            operation="steer",
+            credential_values=self._credential_values,
+        )
+
+    async def cancel_message(self, message_id: str) -> bool:
+        return await _call_sdk(
+            lambda: self._client.cancel_async_message(message_id),
+            operation="cancel_message",
             credential_values=self._credential_values,
         )
 

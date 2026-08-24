@@ -1,15 +1,39 @@
 """Async owner for live Qoder workers and their durable observations."""
 
 import asyncio
+import uuid
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from pathlib import Path
 from typing import cast
 
 from qworker.auditor import ForegroundAuditor, TransportFactory
+from qworker.control import (
+    ApprovalDecision,
+    ApprovalKind,
+    ControlCallbacks,
+    ElicitationDecision,
+    ElicitationRequest,
+    PendingApproval,
+    PermissionDecision,
+    PermissionRequest,
+    SteeringPriority,
+    new_request_id,
+    parse_approval_response,
+)
 from qworker.domain import AuditContract, AuditResult
 from qworker.lifecycle import WorkerRecord
 from qworker.store import EventRecord, JsonValue, WorkerStore
+from qworker.transport import QoderTransport
 
 _TERMINAL_STATES = frozenset(("completed", "failed", "cancelled", "lost"))
+_STEERING_PRIORITIES = frozenset(("now", "next", "later"))
+
+
+@dataclass(frozen=True, slots=True)
+class _LiveAttempt:
+    attempt: int
+    transport: QoderTransport
 
 
 class SupervisorError(Exception):
@@ -41,6 +65,9 @@ class Supervisor:
         self._runtime_version = runtime_version
         self._settlement_timeout = settlement_timeout
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._live_attempts: dict[str, _LiveAttempt] = {}
+        self._pending_approvals: dict[str, PendingApproval] = {}
+        self._control_lock = asyncio.Lock()
         self._event_conditions: dict[str, asyncio.Condition] = {}
         self._closed = False
 
@@ -59,7 +86,7 @@ class Supervisor:
             sdk_version=self._sdk_version,
         )
         task = asyncio.create_task(
-            self._run_worker(worker.worker_id, contract),
+            self._run_worker(worker.worker_id, worker.attempt, contract),
             name=f"qworker:{worker.worker_id}",
         )
         self._tasks[worker.worker_id] = task
@@ -88,6 +115,138 @@ class Supervisor:
 
         worker = await self._require_worker(worker_id)
         return cast(dict[str, JsonValue] | None, worker.result_summary)
+
+    async def steer(
+        self,
+        worker_id: str,
+        message: str,
+        *,
+        priority: SteeringPriority = "next",
+        agent_id: str | None = None,
+    ) -> dict[str, JsonValue]:
+        """Deliver one UUID-stamped message to a live top-level worker."""
+
+        if not message:
+            raise SupervisorError("invalid_request", "Steering message must not be empty.")
+        if priority not in _STEERING_PRIORITIES:
+            raise SupervisorError("invalid_request", "Unknown steering priority.")
+        if agent_id is not None:
+            raise SupervisorError(
+                "unsupported_operation",
+                "Selected nested-agent steering is not supported.",
+            )
+        live = await self._require_live_attempt(worker_id)
+        message_id = str(uuid.uuid4())
+        await self._append_event(
+            worker_id,
+            "steer.queued",
+            {
+                "schema_version": 1,
+                "message_id": message_id,
+                "priority": priority,
+            },
+        )
+        try:
+            await live.transport.steer(
+                message,
+                priority=priority,
+                message_id=message_id,
+            )
+        except Exception:  # noqa: BLE001 -- transport details are not an RPC surface
+            raise SupervisorError(
+                "sdk_protocol_error", "Unable to deliver steering message."
+            ) from None
+        await self._append_event(
+            worker_id,
+            "steer.delivered",
+            {"schema_version": 1, "message_id": message_id},
+        )
+        return {
+            "message_id": message_id,
+            "priority": priority,
+            "accepted": True,
+        }
+
+    async def cancel_message(
+        self, worker_id: str, message_id: str
+    ) -> dict[str, JsonValue]:
+        """Attempt UUID cancellation without strengthening the SDK boolean."""
+
+        _validated_message_id(message_id)
+        live = await self._require_live_attempt(worker_id)
+        try:
+            cancelled = await live.transport.cancel_message(message_id)
+        except Exception:  # noqa: BLE001 -- transport details are not an RPC surface
+            raise SupervisorError(
+                "sdk_protocol_error", "Unable to cancel steering message."
+            ) from None
+        await self._append_event(
+            worker_id,
+            "steer.cancelled",
+            {
+                "schema_version": 1,
+                "message_id": message_id,
+                "cancelled": cancelled,
+            },
+        )
+        return {"message_id": message_id, "cancelled": cancelled}
+
+    async def respond(
+        self,
+        worker_id: str,
+        request_id: str,
+        response: dict[str, JsonValue],
+    ) -> dict[str, JsonValue]:
+        """Resolve one callback future only for its current live attempt."""
+
+        async with self._control_lock:
+            pending = self._pending_approvals.get(request_id)
+            if pending is None or pending.worker_id != worker_id:
+                raise SupervisorError(
+                    "approval_not_pending", "Approval request is not pending."
+                )
+            worker = await self._require_worker(worker_id)
+            live = self._live_attempts.get(worker_id)
+            if (
+                worker.attempt != pending.attempt
+                or worker.state != "requires_action"
+                or live is None
+                or live.attempt != pending.attempt
+            ):
+                raise SupervisorError(
+                    "worker_not_live",
+                    "Approval belongs to an attempt that is no longer live.",
+                )
+            try:
+                decision = parse_approval_response(pending.kind, response)
+            except ValueError as error:
+                raise SupervisorError("invalid_request", str(error)) from None
+            status = _approval_status(decision)
+            await self._append_event(
+                worker_id,
+                "approval.resolved",
+                {
+                    "schema_version": 1,
+                    "request_id": request_id,
+                    "status": status,
+                },
+            )
+            other_pending = any(
+                item.request_id != request_id
+                and item.worker_id == worker_id
+                and item.attempt == pending.attempt
+                for item in self._pending_approvals.values()
+            )
+            if not other_pending:
+                await self._append_event(
+                    worker_id,
+                    "worker.state_changed",
+                    {"schema_version": 1, "state": "running"},
+                )
+            self._pending_approvals.pop(request_id, None)
+            if not pending.future.done():
+                pending.future.set_result(decision)
+            return {"request_id": request_id, "status": status}
 
     async def watch(
         self,
@@ -142,8 +301,38 @@ class Supervisor:
                 condition.notify_all()
         await self._store.close()
 
-    async def _run_worker(self, worker_id: str, contract: AuditContract) -> None:
+    async def _run_worker(
+        self, worker_id: str, attempt: int, contract: AuditContract
+    ) -> None:
         initialized = False
+
+        def owned_transport_factory(cwd: Path) -> QoderTransport:
+            transport = self._transport_factory(cwd)
+
+            async def request_permission(
+                request: PermissionRequest,
+            ) -> PermissionDecision:
+                decision = await self._request_approval(
+                    worker_id, attempt, request
+                )
+                return cast(PermissionDecision, decision)
+
+            async def request_elicitation(
+                request: ElicitationRequest,
+            ) -> ElicitationDecision:
+                decision = await self._request_approval(
+                    worker_id, attempt, request
+                )
+                return cast(ElicitationDecision, decision)
+
+            transport.bind_control(
+                ControlCallbacks(
+                    request_permission=request_permission,
+                    request_elicitation=request_elicitation,
+                )
+            )
+            self._live_attempts[worker_id] = _LiveAttempt(attempt, transport)
+            return transport
 
         async def on_initialized(resolved_model: str) -> None:
             nonlocal initialized
@@ -165,16 +354,21 @@ class Supervisor:
             initialized = True
 
         auditor = ForegroundAuditor(
-            self._transport_factory,
+            owned_transport_factory,
             settlement_timeout=self._settlement_timeout,
             on_initialized=on_initialized,
         )
         try:
-            result = await auditor.run(contract)
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001 -- isolate an arbitrary transport failure
-            result = _execution_failure(contract)
+            try:
+                result = await auditor.run(contract)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 -- isolate an arbitrary transport failure
+                result = _execution_failure(contract)
+        finally:
+            current = self._live_attempts.get(worker_id)
+            if current is not None and current.attempt == attempt:
+                self._live_attempts.pop(worker_id, None)
 
         await self._store.record_result(
             worker_id,
@@ -223,6 +417,90 @@ class Supervisor:
         if worker is None:
             raise SupervisorError("worker_not_found", f"Unknown worker: {worker_id}")
         return worker
+
+    async def _require_live_attempt(self, worker_id: str) -> _LiveAttempt:
+        if self._closed:
+            raise SupervisorError("supervisor_unavailable", "Supervisor is closed.")
+        worker = await self._require_worker(worker_id)
+        live = self._live_attempts.get(worker_id)
+        if (
+            live is None
+            or live.attempt != worker.attempt
+            or worker.state not in ("running", "requires_action")
+        ):
+            raise SupervisorError("worker_not_live", "Worker has no live attempt.")
+        return live
+
+    async def _request_approval(
+        self,
+        worker_id: str,
+        attempt: int,
+        request: PermissionRequest | ElicitationRequest,
+    ) -> ApprovalDecision:
+        default = (
+            PermissionDecision("deny")
+            if isinstance(request, PermissionRequest)
+            else ElicitationDecision("cancel")
+        )
+        async with self._control_lock:
+            worker = await self._store.get_worker(worker_id)
+            live = self._live_attempts.get(worker_id)
+            if (
+                self._closed
+                or worker is None
+                or worker.attempt != attempt
+                or worker.state not in ("running", "requires_action")
+                or live is None
+                or live.attempt != attempt
+            ):
+                return default
+            kind: ApprovalKind = (
+                "tool_permission"
+                if isinstance(request, PermissionRequest)
+                else "elicitation"
+            )
+            request_id = new_request_id()
+            pending = PendingApproval(
+                request_id=request_id,
+                worker_id=worker_id,
+                attempt=attempt,
+                kind=kind,
+                future=asyncio.get_running_loop().create_future(),
+            )
+            self._pending_approvals[request_id] = pending
+            payload: dict[str, JsonValue] = {
+                "schema_version": 1,
+                "request_id": request_id,
+                "kind": kind,
+            }
+            if (
+                isinstance(request, PermissionRequest)
+                and request.agent_id is not None
+                and _safe_identifier(request.agent_id)
+            ):
+                payload["agent_id"] = request.agent_id
+            try:
+                await self._append_event(
+                    worker_id,
+                    "approval.requested",
+                    payload,
+                )
+                if worker.state == "running":
+                    await self._append_event(
+                        worker_id,
+                        "worker.state_changed",
+                        {"schema_version": 1, "state": "requires_action"},
+                    )
+            except BaseException:
+                self._pending_approvals.pop(request_id, None)
+                raise
+        try:
+            return await pending.future
+        finally:
+            if pending.future.cancelled():
+                async with self._control_lock:
+                    if self._pending_approvals.get(request_id) is pending:
+                        self._pending_approvals.pop(request_id, None)
 
     def _task_finished(self, worker_id: str, completed: asyncio.Task[None]) -> None:
         self._tasks.pop(worker_id, None)
@@ -313,3 +591,28 @@ def _execution_failure(contract: AuditContract) -> AuditResult:
         resolved_model=None,
         errors=("sdk_protocol_error",),
     )
+
+
+def _validated_message_id(message_id: str) -> None:
+    try:
+        parsed = uuid.UUID(message_id)
+    except (AttributeError, ValueError):
+        raise SupervisorError(
+            "invalid_request", "message_id must be a canonical UUID."
+        ) from None
+    if str(parsed) != message_id:
+        raise SupervisorError(
+            "invalid_request", "message_id must be a canonical UUID."
+        )
+
+
+def _approval_status(decision: ApprovalDecision) -> str:
+    if isinstance(decision, PermissionDecision):
+        return "allowed" if decision.action == "allow" else "denied"
+    return "answered" if decision.action == "accept" else "denied"
+
+
+def _safe_identifier(value: str) -> bool:
+    if not value or len(value) > 128:
+        return False
+    return all(character.isalnum() or character in "._:-" for character in value)

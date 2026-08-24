@@ -3,6 +3,7 @@
 import asyncio
 from collections.abc import AsyncIterator
 
+from qworker.control import ControlCallbacks, SteeringPriority
 from qworker.events import AdapterEvent, ResultEvent
 from qworker.model_policy import AvailableModel
 
@@ -32,6 +33,7 @@ class FakeQoderTransport:
         self.calls: list[str] = []
         self.disconnected = False
         self.sent_prompts: list[str] = []
+        self.control_callbacks: ControlCallbacks | None = None
 
     @classmethod
     def successful_audit(cls, *, model: str) -> "FakeQoderTransport":
@@ -60,6 +62,22 @@ class FakeQoderTransport:
     async def send(self, prompt: str) -> None:
         self.calls.append("send")
         self.sent_prompts.append(prompt)
+
+    def bind_control(self, callbacks: ControlCallbacks) -> None:
+        self.control_callbacks = callbacks
+
+    async def steer(
+        self,
+        message: str,
+        *,
+        priority: SteeringPriority,
+        message_id: str,
+    ) -> None:
+        del message, priority, message_id
+
+    async def cancel_message(self, message_id: str) -> bool:
+        del message_id
+        return False
 
     async def messages(self) -> AsyncIterator[AdapterEvent]:
         for index, event in enumerate(self._events):
