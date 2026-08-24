@@ -75,6 +75,7 @@ class Supervisor:
         self._stop_timeout = min(stop_timeout, _MAX_STOP_TIMEOUT)
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._live_attempts: dict[str, _LiveAttempt] = {}
+        self._result_phases: dict[tuple[str, int], asyncio.Task[None]] = {}
         self._stop_requests: set[tuple[str, int]] = set()
         self._pending_approvals: dict[str, PendingApproval] = {}
         self._control_lock = asyncio.Lock()
@@ -237,18 +238,24 @@ class Supervisor:
                 raise SupervisorError("worker_not_live", "Worker has no live attempt.")
             attempt = worker.attempt
             self._stop_requests.add((worker_id, attempt))
+            result_phase = self._result_phases.get((worker_id, attempt))
             live = self._live_attempts.get(worker_id)
             if live is not None and live.attempt != attempt:
                 live = None
 
-        if live is None and not force:
+        if result_phase is not None:
+            await asyncio.gather(asyncio.shield(result_phase), return_exceptions=True)
+            await asyncio.gather(asyncio.shield(task), return_exceptions=True)
+        elif live is None and not force:
             await asyncio.sleep(0)
             current = self._live_attempts.get(worker_id)
             if current is not None and current.attempt == attempt:
                 live = current
 
-        terminate = force
-        if not force and live is not None:
+        terminate = force and result_phase is None
+        if result_phase is not None:
+            terminate = False
+        elif not force and live is not None:
             deadline = asyncio.get_running_loop().time() + self._stop_timeout
             try:
                 async with asyncio.timeout_at(deadline):
@@ -489,8 +496,6 @@ class Supervisor:
         except Exception:  # noqa: BLE001 -- isolate an arbitrary transport failure
             result = _execution_failure(contract)
 
-        await self._complete_live_attempt(worker_id, attempt)
-
         if "result_missing" in result.errors:
             missing_state = (
                 "cancelled"
@@ -504,6 +509,30 @@ class Supervisor:
             )
             return
 
+        result_key = (worker_id, attempt)
+        result_phase = asyncio.create_task(
+            self._persist_accepted_result(worker_id, attempt, result, initialized),
+            name=f"qworker-result:{worker_id}",
+        )
+        self._result_phases[result_key] = result_phase
+        try:
+            await asyncio.shield(result_phase)
+        except asyncio.CancelledError:
+            await asyncio.shield(result_phase)
+        finally:
+            if self._result_phases.get(result_key) is result_phase:
+                self._result_phases.pop(result_key, None)
+
+    async def _persist_accepted_result(
+        self,
+        worker_id: str,
+        attempt: int,
+        result: AuditResult,
+        initialized: bool,
+    ) -> None:
+        """Durably commit an accepted result through its result-derived terminal state."""
+
+        await self._complete_live_attempt(worker_id, attempt)
         await self._store.record_result(
             worker_id,
             outcome=result.outcome,

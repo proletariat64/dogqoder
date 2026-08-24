@@ -3,6 +3,7 @@ import json
 from collections.abc import AsyncIterator, Mapping
 from io import StringIO
 from pathlib import Path
+from typing import Literal
 
 import pytest
 from qoder_agent_sdk import ProcessError
@@ -11,7 +12,7 @@ from qworker.cli import run
 from qworker.control import ControlCallbacks, PermissionRequest
 from qworker.domain import AuditContract
 from qworker.events import AdapterEvent, ResultEvent, TaskStartedEvent
-from qworker.lifecycle import WorkerStateReducer
+from qworker.lifecycle import NestedState, WorkerStateReducer
 from qworker.model_policy import AvailableModel
 from qworker.qoder_sdk import QoderSDKTransport
 from qworker.rpc import RPCServer
@@ -101,6 +102,40 @@ class OrderingStore(WorkerStore):
         ):
             self._order.append(str(payload["state"]))
         return await super().append_event(worker_id, event_type, payload)
+
+
+class PausedResultStore(WorkerStore):
+    """Expose the accepted-result persistence window to deterministic stop tests."""
+
+    def __init__(self, state_dir: Path) -> None:
+        super().__init__(state_dir)
+        self.record_started = asyncio.Event()
+        self.allow_record = asyncio.Event()
+
+    async def record_result(
+        self,
+        worker_id: str,
+        *,
+        outcome: Literal["completed", "partial", "blocked", "failed"],
+        result_summary: Mapping[str, JsonValue],
+        resolved_model: str | None,
+        actual_models: tuple[str, ...],
+        session_id: str | None,
+        nested_state: NestedState,
+        warnings: tuple[str, ...],
+    ) -> EventRecord:
+        self.record_started.set()
+        await self.allow_record.wait()
+        return await super().record_result(
+            worker_id,
+            outcome=outcome,
+            result_summary=result_summary,
+            resolved_model=resolved_model,
+            actual_models=actual_models,
+            session_id=session_id,
+            nested_state=nested_state,
+            warnings=warnings,
+        )
 
 
 async def _spawn_running(
@@ -557,6 +592,55 @@ async def test_force_stop_preserves_result_already_seen_during_settlement(
     warnings = result["warnings"]
     assert isinstance(warnings, list)
     assert "nested_terminal_event_missing" in warnings
+    await supervisor.close()
+
+
+@pytest.mark.parametrize("force", (False, True))
+@pytest.mark.parametrize("is_error", (False, True))
+async def test_stop_joins_accepted_result_persistence(
+    tmp_path: Path,
+    force: bool,
+    is_error: bool,
+) -> None:
+    store = PausedResultStore(tmp_path / "state")
+    transport = FakeQoderTransport(
+        models=(AvailableModel(value="Qwen3.8-Max", enabled=True),),
+        events=(
+            ResultEvent(
+                session_id="session-before-persistence-stop",
+                is_error=is_error,
+                result=SUCCESSFUL_AUDIT_REPORT,
+                errors=("model_error",) if is_error else (),
+            ),
+        ),
+    )
+    supervisor = Supervisor(
+        store,
+        lambda _cwd: transport,
+        sdk_version="1.0.13",
+    )
+    worker_id = await _spawn_running(supervisor, tmp_path)
+    await asyncio.wait_for(store.record_started.wait(), timeout=0.2)
+
+    stop_task = asyncio.create_task(supervisor.stop(worker_id, force=force))
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert not stop_task.done()
+    store.allow_record.set()
+    stopped = await asyncio.wait_for(stop_task, timeout=0.2)
+
+    expected_state = "failed" if is_error else "completed"
+    result = await supervisor.result(worker_id)
+    events = [event async for event in supervisor.watch(worker_id, since=0)]
+    assert stopped["state"] == expected_state
+    assert result is not None
+    assert result["outcome"] == expected_state
+    assert result["session_id"] == "session-before-persistence-stop"
+    assert [event["type"] for event in events][-3:] == [
+        "result.received",
+        "worker.health_changed",
+        "worker.state_changed",
+    ]
     await supervisor.close()
 
 
