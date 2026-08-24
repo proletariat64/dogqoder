@@ -41,6 +41,8 @@ Status meanings:
 
 - **Demonstrated**: exercised through a default credential-free public
   interface, with supporting lower-level coverage where needed.
+- **Live-confirmed**: deterministic evidence plus a bounded observation from the
+  installed credentialed Qoder runtime.
 - **Partial**: deterministic behavior is proven, but a required live-runtime or
   OS-process observation is absent.
 - **Blocked**: required public capability or trustworthy evidence is absent.
@@ -50,7 +52,7 @@ Status meanings:
 | 1 | Demonstrated | `test_public_cli_controls_two_workers_and_replays_each_cursor` launches two concurrent `spawn` CLI processes. Both return immediately with distinct stable IDs and remain `running` together. |
 | 2 | Demonstrated | Same test uses fresh CLI processes for `status`, `watch`, `steer`, `cancel-message`, `respond`, and `result` while one supervisor owns both attempts. |
 | 3 | Demonstrated | Same test replays from zero, reconnects with the last cursor, follows to terminal state, and asserts contiguous per-worker sequences without cross-worker events. |
-| 4 | Partial | Same test proves requested `qwen-auditor`, resolved `Qwen3.8-Max`, and actual `Qwen3.8-Max` fields at the deterministic public result boundary. The bounded live marker reached a structured result, but its outcome was not completed and the model assertions therefore did not execute. |
+| 4 | Live-confirmed | The deterministic lifecycle test proves requested `qwen-auditor`, resolved `Qwen3.8-Max`, and actual `Qwen3.8-Max` fields at the public result boundary. The authorized live rerun confirmed accepted/starting/running/result/completed lifecycle, no requires-action/lost/failed state, bundled runtime selection, and resolved plus actual `Qwen3.8-Max` reporting. |
 | 5 | Partial | `test_public_coder_edits_disposable_workspace_without_leaking_credentials` drives `spawn --role coder`, watch, and result against a disposable workspace; the transport edit and validation report cross the public boundary with no `.git` worktree. A real-Qoder coder was intentionally not run in this bounded UAT. |
 | 6 | Partial | `test_auditor_callback_denies_top_level_and_direct_helper_mutation` invokes the actual configured SDK callback for top-level and nested contexts. Write, edit, notebook, shell, unknown, mutation-capable extension, and nested recursion requests are denied and the workspace byte snapshot is unchanged. No live agent was prompted to attempt every denial. |
 | 7 | Blocked | Adapter contract coverage normalizes Qoder task-start/progress/terminal messages, and the new lifecycle fixture emits direct-helper task events. The public supervisor persists neither those task events nor a transcript locator. Context7 exposed cloud session endpoints, not a local Python transcript API. No post-run helper transcript can therefore be discovered through qworker's public CLI. |
@@ -68,7 +70,7 @@ Focused public-interface checks completed before any live test:
 
 ```bash
 uv run pytest tests/integration/test_real_worker_lifecycle.py -m 'not real_qoder' -q
-# 1 passed
+# 2 passed, 1 deselected
 
 uv run pytest tests/integration/test_real_auditor_security.py -m 'not real_qoder' -q
 # 2 passed
@@ -82,7 +84,7 @@ after the suite completes:
 
 ```bash
 uv run pytest -m 'not real_qoder' -q
-# 258 passed, 4 deselected in 22.96s
+# 259 passed, 4 deselected in 33.21s
 
 uv run ruff format --check src tests
 # Failed: 7 pre-existing/shared files outside Task 14 scope would be reformatted:
@@ -108,7 +110,7 @@ directory, sends the objective over stdin, captures child stdout/stderr, applies
 per-process and outer timeouts, performs no write request, and emits no token,
 session ID, prompt, marker, or model response.
 
-Executed one-shot command:
+Initial one-shot diagnostic:
 
 ```bash
 timeout 210s uv run pytest -m real_qoder tests/integration/test_real_worker_lifecycle.py::test_real_public_lifecycle_reports_model_and_keeps_workspace_read_only -q
@@ -124,10 +126,43 @@ ID, prompt, marker, or model response appeared in test output.
 The command was not retried and no other `real_qoder` test ran. Assertions for
 resolved/actual model and the final workspace byte snapshot followed the
 completion gate and therefore did not execute; they remain unconfirmed by this
-run. The opt-in test now records this same live condition as an expected
-blocked result rather than turning an environmental live limitation into a
-default-suite failure. The SDK does not expose cost through this result, so the
-credit cost is unknown and may be nonzero.
+initial run. The SDK does not expose cost through this result, so the credit
+cost is unknown and may be nonzero.
+
+### Diagnosis and authorized rerun
+
+The initial assertion incorrectly used structured audit outcome as a proxy for
+worker lifecycle state. A deterministic repro proves why that is invalid: a
+non-error result that does not satisfy the strict report schema is intentionally
+reduced to `outcome=partial` with `report_contract_unparseable`, while worker
+lifecycle reaches `completed`. The regression locks down that distinction
+without claiming the first live run exposed a diagnostic it did not capture:
+
+```bash
+uv run pytest tests/integration/test_real_worker_lifecycle.py::test_public_lifecycle_distinguishes_partial_result_from_completed_worker -q
+# 1 passed in 0.59s
+```
+
+Test-only instrumentation reduces all public frames to fixed booleans. It can
+distinguish accepted, starting, running, requires-action, result, lost, failed,
+and completed without retaining or emitting a worker ID, prompt, token, session
+ID, transcript, marker, response text, or raw diagnostic.
+
+After the user explicitly authorized continuing UAT, exactly one bounded rerun
+of the same live node executed:
+
+```bash
+timeout 210s uv run pytest -m real_qoder tests/integration/test_real_worker_lifecycle.py::test_real_public_lifecycle_reports_model_and_keeps_workspace_read_only -q
+# 1 passed in 16.62s
+```
+
+The passing fixed-boolean gates confirm `accepted=true`, `starting=true`,
+`running=true`, `result=true`, and `completed=true`; they also confirm
+`requires_action=false`, `lost=false`, `failed=false`, resolved and actual
+`Qwen3.8-Max`, and bundled runtime selection. Credential exclusion, recovery of
+the private marker in the structured summary, and an unchanged disposable
+workspace byte snapshot also passed. Captured output contained only pytest's
+pass summary. No other real test ran and the authorized rerun was not retried.
 
 ## Remaining acceptance work
 

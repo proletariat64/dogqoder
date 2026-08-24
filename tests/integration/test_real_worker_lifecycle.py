@@ -14,6 +14,7 @@ from typing import cast
 import pytest
 
 from qworker.control import ControlCallbacks, PermissionRequest, SteeringPriority
+from qworker.domain import AuditContract
 from qworker.events import (
     AdapterEvent,
     ResultEvent,
@@ -154,6 +155,127 @@ async def _wait_for_state(
             return status
         await asyncio.sleep(0)
     raise AssertionError(f"worker did not reach {expected}")
+
+
+def _safe_lifecycle_evidence(
+    spawn_frames: Sequence[dict[str, object]],
+    events: Sequence[dict[str, object]],
+    result: dict[str, object],
+    status: dict[str, object],
+) -> dict[str, bool]:
+    """Reduce public output to fixed booleans safe for live failure reporting."""
+
+    observed_states = {
+        state
+        for state in (
+            "starting",
+            "running",
+            "requires_action",
+            "lost",
+            "failed",
+            "completed",
+        )
+        if any(
+            frame.get("type") == "worker.state_changed"
+            and isinstance(frame.get("payload"), dict)
+            and cast(dict[str, object], frame["payload"]).get("state") == state
+            for frame in events
+        )
+        or status.get("state") == state
+        or any(frame.get("state") == state for frame in spawn_frames)
+    }
+    warnings = result.get("warnings")
+    warning_values = warnings if isinstance(warnings, list) else []
+    actual_models = result.get("actual_models")
+    actual_model_values = actual_models if isinstance(actual_models, list) else []
+    return {
+        "accepted": len(spawn_frames) == 1
+        and isinstance(spawn_frames[0].get("worker_id"), str),
+        "starting": "starting" in observed_states,
+        "running": "running" in observed_states,
+        "requires_action": "requires_action" in observed_states,
+        "result": bool(result)
+        and any(frame.get("type") == "result.received" for frame in events),
+        "lost": "lost" in observed_states,
+        "failed": "failed" in observed_states,
+        "completed": "completed" in observed_states,
+        "result_completed": result.get("outcome") == "completed",
+        "result_partial": result.get("outcome") == "partial",
+        "result_failed": result.get("outcome") == "failed",
+        "report_contract_unparseable": "report_contract_unparseable" in warning_values,
+        "resolved_qwen_max": result.get("resolved_model") == "Qwen3.8-Max",
+        "actual_qwen_max": "Qwen3.8-Max" in actual_model_values,
+        "bundled_runtime": status.get("runtime_path") == "bundled",
+    }
+
+
+def _fail_with_safe_evidence(evidence: dict[str, bool]) -> None:
+    pytest.fail(
+        f"QWORKER_TASK14_UAT {json.dumps(evidence, sort_keys=True)}",
+        pytrace=False,
+    )
+
+
+async def test_public_lifecycle_distinguishes_partial_result_from_completed_worker(
+    tmp_path: Path,
+) -> None:
+    """Regress the live marker's partial-result/completed-state distinction."""
+
+    transport = FakeQoderTransport(
+        models=(AvailableModel(value="Qwen3.8-Max", enabled=True),),
+        events=(
+            ResultEvent(
+                session_id="safe-regression-session",
+                is_error=False,
+                result="safe unstructured marker",
+                model_usage=("Qwen3.8-Max",),
+            ),
+        ),
+    )
+    supervisor = Supervisor(
+        WorkerStore(tmp_path / "state"),
+        lambda _cwd: transport,
+        sdk_version="1.0.13",
+    )
+    try:
+        accepted = await supervisor.spawn(
+            AuditContract(
+                objective="return one deliberately unstructured safe marker",
+                cwd=tmp_path,
+            )
+        )
+        worker_id = str(accepted["worker_id"])
+        events = [
+            event async for event in supervisor.watch(worker_id, since=0, follow=True)
+        ]
+        result = await supervisor.result(worker_id)
+        assert result is not None
+        status = await supervisor.status(worker_id)
+
+        assert _safe_lifecycle_evidence(
+            [cast(dict[str, object], accepted)],
+            cast(list[dict[str, object]], events),
+            cast(dict[str, object], result),
+            cast(dict[str, object], status),
+        ) == {
+            "accepted": True,
+            "starting": True,
+            "running": True,
+            "requires_action": False,
+            "result": True,
+            "lost": False,
+            "failed": False,
+            "completed": True,
+            "result_completed": False,
+            "result_partial": True,
+            "result_failed": False,
+            "report_contract_unparseable": True,
+            "resolved_qwen_max": True,
+            "actual_qwen_max": True,
+            "bundled_runtime": True,
+        }
+    finally:
+        await supervisor.close()
 
 
 async def test_public_cli_controls_two_workers_and_replays_each_cursor(
@@ -421,18 +543,27 @@ async def test_real_public_lifecycle_reports_model_and_keeps_workspace_read_only
             pytest.fail(
                 "Live marker was absent from the structured summary.", pytrace=False
             )
-        if result.get("outcome") != "completed":
-            pytest.xfail(
-                "Task 14 live public worker did not produce a completed result."
-            )
-        if result.get("resolved_model") != "Qwen3.8-Max":
-            pytest.fail("Live catalog did not resolve Qwen3.8-Max.", pytrace=False)
-        if "Qwen3.8-Max" not in cast(list[object], result.get("actual_models", [])):
-            pytest.fail("Live result did not report Qwen3.8-Max usage.", pytrace=False)
-        if status.get("runtime_path") != "bundled":
-            pytest.fail(
-                "Live worker did not report the bundled runtime.", pytrace=False
-            )
+        evidence = _safe_lifecycle_evidence(spawn_frames, events, result, status)
+        required_evidence = {
+            "accepted": True,
+            "starting": True,
+            "running": True,
+            "requires_action": False,
+            "result": True,
+            "lost": False,
+            "failed": False,
+            "completed": True,
+            "result_failed": False,
+            "resolved_qwen_max": True,
+            "actual_qwen_max": True,
+            "bundled_runtime": True,
+        }
+        if any(evidence[key] is not value for key, value in required_evidence.items()):
+            _fail_with_safe_evidence(evidence)
+        if not evidence["result_completed"] and not (
+            evidence["result_partial"] and evidence["report_contract_unparseable"]
+        ):
+            _fail_with_safe_evidence(evidence)
         after = {
             path.relative_to(workspace): path.read_bytes()
             for path in workspace.rglob("*")
