@@ -27,7 +27,12 @@ from qworker.control import (
 )
 from qworker.domain import AuditContract, AuditResult
 from qworker.lifecycle import WorkerRecord
-from qworker.preflight import PreflightRunner
+from qworker.preflight import (
+    PreflightRunner,
+    PreflightWarningCode,
+    normalize_preflight_warnings,
+    safe_preflight_failure,
+)
 from qworker.store import AttemptChangedError, EventRecord, JsonValue, WorkerStore
 from qworker.transport import QoderTransport
 
@@ -51,10 +56,17 @@ class _StopOperation:
 class SupervisorError(Exception):
     """Stable supervisor error suitable for an RPC response."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        warnings: tuple[PreflightWarningCode, ...] = (),
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        self.warnings = warnings
 
 
 class Supervisor:
@@ -108,7 +120,12 @@ class Supervisor:
                     raise SupervisorError(
                         "sdk_protocol_error", "Qoder preflight returned no diagnostic."
                     )
-                raise SupervisorError(diagnostic.code, diagnostic.message)
+                diagnostic = safe_preflight_failure(diagnostic.code)
+                raise SupervisorError(
+                    diagnostic.code,
+                    diagnostic.message,
+                    warnings=normalize_preflight_warnings(preflight.warnings),
+                )
             if preflight.sdk_version is None or preflight.runtime_path is None:
                 raise SupervisorError(
                     "sdk_protocol_error", "Qoder preflight returned incomplete metadata."

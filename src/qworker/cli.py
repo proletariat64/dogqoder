@@ -10,7 +10,12 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import NoReturn, TextIO, cast
 
-from qworker.preflight import DoctorResult, PreflightRunner, RuntimePreflight
+from qworker.preflight import (
+    DoctorResult,
+    PreflightRunner,
+    PreflightWarningCode,
+    RuntimePreflight,
+)
 from qworker.rpc import RPCClientError, call, default_state_dir, watch
 from qworker.store import JsonValue
 
@@ -156,7 +161,12 @@ async def run(
         _write_error(stdout, "invalid_request", str(error))
         return 2
     except RPCClientError as error:
-        _write_error(stdout, error.code, error.message)
+        _write_error(
+            stdout,
+            error.code,
+            error.message,
+            warnings=error.warnings,
+        )
         if error.code == "invalid_request":
             return 2
         if error.code == "supervisor_unavailable":
@@ -332,8 +342,17 @@ def _write_json(stdout: TextIO, value: JsonValue) -> None:
     stdout.flush()
 
 
-def _write_error(stdout: TextIO, code: str, message: str) -> None:
+def _write_error(
+    stdout: TextIO,
+    code: str,
+    message: str,
+    *,
+    warnings: tuple[PreflightWarningCode, ...] = (),
+) -> None:
+    error: dict[str, JsonValue] = {"code": code, "message": message}
+    if warnings:
+        error["warnings"] = list(warnings)
     _write_json(
         stdout,
-        {"ok": False, "error": {"code": code, "message": message}},
+        {"ok": False, "error": error},
     )

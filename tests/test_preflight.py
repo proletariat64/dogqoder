@@ -26,6 +26,7 @@ from qworker.qoder_sdk import (
     QoderPreflightBackend,
     build_configured_auditor_options,
 )
+from qworker.rpc import RPCClientError, RPCServer, call
 from qworker.store import WorkerStore
 from qworker.supervisor import Supervisor, SupervisorError
 from tests.fakes import FakeQoderTransport
@@ -272,7 +273,7 @@ async def test_authentication_selection_has_fixed_priority(
     assert result.ok is True
     assert result.auth_source == expected_source
     assert backend.auth == [AuthSelection(expected_source, expected_env)]
-    assert result.capabilities == ("modelPolicy", "steering")
+    assert result.capabilities == ("modelPolicy",)
 
 
 @pytest.mark.parametrize(
@@ -427,9 +428,15 @@ async def test_local_login_initialize_timeout_is_redacted_and_actionable(
     environment = {
         key: value
         for key, value in os.environ.items()
-        if key not in {"QODER_PERSONAL_ACCESS_TOKEN", "QODERCLI_PATH"}
+        if key
+        not in {
+            "QODER_PERSONAL_ACCESS_TOKEN",
+            "QODER_SERVICE_ACCOUNT_KEY",
+            "QODERCN_PERSONAL_ACCESS_TOKEN",
+            "QODERCN_SERVICE_ACCOUNT_KEY",
+            "QODERCLI_PATH",
+        }
     }
-    environment["QODER_SERVICE_ACCOUNT_KEY"] = secret
 
     result = await RuntimePreflight(
         backend,
@@ -444,6 +451,50 @@ async def test_local_login_initialize_timeout_is_redacted_and_actionable(
     assert commands[-1][-1] == "status"
     assert clients[0].calls == ["connect", "disconnect"]
     assert secret not in json.dumps(result.to_json())
+
+
+async def test_local_login_capabilities_are_allowlisted_without_credentials(
+    tmp_path: Path,
+) -> None:
+    local_credential = "fake-local-login-credential"
+    clients: list[FakeControlClient] = []
+
+    def client_factory(options: QoderAgentOptions) -> object:
+        client = FakeControlClient(
+            options,
+            server_info={
+                "capabilities": {
+                    "modelPolicy": "pull",
+                    local_credential: "runtime-private",
+                    "futureArbitraryField": local_credential,
+                }
+            },
+        )
+        clients.append(client)
+        return client
+
+    async def command_runner(command: tuple[str, ...]) -> CommandResult:
+        assert command[-1] == "-v"
+        return CommandResult(returncode=0, stdout="1.1.23")
+
+    user_config = tmp_path / "user.toml"
+    user_config.write_text(
+        "[auth]\nreuse_qodercli = true\n",
+        encoding="utf-8",
+    )
+    result = await RuntimePreflight(
+        QoderPreflightBackend(
+            client_factory=client_factory,
+            command_runner=command_runner,
+        ),
+        environ={},
+        user_path=user_config,
+    ).run(tmp_path)
+
+    assert result.ok is True
+    assert result.capabilities == ("modelPolicy",)
+    assert clients[0].calls == ["connect", "server_info", "disconnect"]
+    assert local_credential not in json.dumps(result.to_json())
 
 
 async def test_doctor_cli_renders_injected_preflight_result() -> None:
@@ -558,7 +609,7 @@ async def test_spawn_rejects_failed_preflight_before_persistence(
             warnings=("qodercli_auth_reuse_failed",),
             error=PreflightDiagnostic(
                 "initialize_timeout",
-                "Qoder control initialization timed out.",
+                "Control request timeout: initialize fake-local-login-credential",
             ),
         )
 
@@ -576,7 +627,107 @@ async def test_spawn_rejects_failed_preflight_before_persistence(
 
     assert caught.value.code == "initialize_timeout"
     assert caught.value.message == "Qoder control initialization timed out."
+    assert caught.value.warnings == ("qodercli_auth_reuse_failed",)
     assert store.database_path.exists() is False
+    await supervisor.close()
+
+
+async def test_spawn_rpc_preserves_preflight_warning(tmp_path: Path) -> None:
+    async def failed_preflight(cwd: Path) -> DoctorResult:
+        del cwd
+        return DoctorResult(
+            ok=False,
+            sdk_version="1.0.13",
+            runtime_path="bundled",
+            runtime_version="1.1.23",
+            auth_source="qodercli",
+            warnings=("qodercli_auth_reuse_failed",),
+            error=PreflightDiagnostic(
+                "initialize_timeout",
+                "Qoder control initialization timed out.",
+            ),
+        )
+
+    supervisor = Supervisor(
+        WorkerStore(tmp_path / "state"),
+        lambda _: FakeQoderTransport.successful_audit(model="Qwen3.8-Max"),
+        sdk_version="1.0.13",
+        preflight=failed_preflight,
+    )
+    socket_path = tmp_path / "runtime" / "qworker.sock"
+    server = RPCServer(supervisor, socket_path)
+    await server.start()
+
+    with pytest.raises(RPCClientError) as caught:
+        await call(
+            socket_path,
+            "spawn",
+            {
+                "role": "auditor",
+                "cwd": str(tmp_path),
+                "objective": "warning must reach RPC client",
+            },
+        )
+
+    assert caught.value.code == "initialize_timeout"
+    assert caught.value.warnings == ("qodercli_auth_reuse_failed",)
+    await server.close()
+    await supervisor.close()
+
+
+async def test_spawn_cli_renders_preflight_warning(tmp_path: Path) -> None:
+    async def failed_preflight(cwd: Path) -> DoctorResult:
+        del cwd
+        return DoctorResult(
+            ok=False,
+            sdk_version="1.0.13",
+            runtime_path="bundled",
+            runtime_version="1.1.23",
+            auth_source="qodercli",
+            warnings=("qodercli_auth_reuse_failed",),
+            error=PreflightDiagnostic(
+                "initialize_timeout",
+                "Qoder control initialization timed out.",
+            ),
+        )
+
+    supervisor = Supervisor(
+        WorkerStore(tmp_path / "state"),
+        lambda _: FakeQoderTransport.successful_audit(model="Qwen3.8-Max"),
+        sdk_version="1.0.13",
+        preflight=failed_preflight,
+    )
+    socket_path = tmp_path / "runtime" / "qworker.sock"
+    server = RPCServer(supervisor, socket_path)
+    await server.start()
+    stdout = StringIO()
+
+    exit_code = await run(
+        [
+            "--socket",
+            str(socket_path),
+            "spawn",
+            "--role",
+            "auditor",
+            "--cwd",
+            str(tmp_path),
+            "--no-start-supervisor",
+            "--json",
+        ],
+        stdin=StringIO("warning must reach CLI"),
+        stdout=stdout,
+    )
+
+    assert exit_code == 1
+    assert json.loads(stdout.getvalue()) == {
+        "ok": False,
+        "error": {
+            "code": "initialize_timeout",
+            "message": "Qoder control initialization timed out.",
+            "warnings": ["qodercli_auth_reuse_failed"],
+        },
+    }
+    await server.close()
     await supervisor.close()
 
 

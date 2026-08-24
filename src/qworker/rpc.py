@@ -16,6 +16,10 @@ from typing import cast
 
 from qworker.control import SteeringPriority
 from qworker.domain import AuditContract
+from qworker.preflight import (
+    PreflightWarningCode,
+    normalize_preflight_warnings,
+)
 from qworker.store import JsonValue
 from qworker.supervisor import Supervisor, SupervisorError
 
@@ -124,7 +128,12 @@ class RPCServer:
                 except SupervisorError as error:
                     await _write_frame(
                         writer,
-                        _failure(request_id, error.code, error.message),
+                        _failure(
+                            request_id,
+                            error.code,
+                            error.message,
+                            warnings=error.warnings,
+                        ),
                     )
                 except (TypeError, ValueError) as error:
                     await _write_frame(
@@ -293,10 +302,17 @@ class RPCServer:
 class RPCClientError(Exception):
     """Structured local connection, remote, or protocol failure."""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        warnings: tuple[PreflightWarningCode, ...] = (),
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        self.warnings = warnings
 
 
 async def call(
@@ -492,7 +508,19 @@ def _validated_response(line: bytes, request_id: str) -> JsonObject:
             raise RPCClientError(
                 "sdk_protocol_error", "Supervisor returned an invalid error."
             )
-        raise RPCClientError(code, message)
+        raw_warnings = error.get("warnings", [])
+        if not isinstance(raw_warnings, list) or not all(
+            isinstance(warning, str) for warning in raw_warnings
+        ):
+            raise RPCClientError(
+                "sdk_protocol_error", "Supervisor returned an invalid error."
+            )
+        warnings = normalize_preflight_warnings(tuple(cast(list[str], raw_warnings)))
+        if tuple(raw_warnings) != warnings:
+            raise RPCClientError(
+                "sdk_protocol_error", "Supervisor returned an invalid error."
+            )
+        raise RPCClientError(code, message, warnings=warnings)
     if "result" not in response:
         raise RPCClientError(
             "sdk_protocol_error", "Supervisor response omitted its result."
@@ -585,11 +613,20 @@ def _success(request_id: JsonValue, result: JsonValue) -> JsonObject:
     return {"request_id": request_id, "ok": True, "result": result}
 
 
-def _failure(request_id: JsonValue, code: str, message: str) -> JsonObject:
+def _failure(
+    request_id: JsonValue,
+    code: str,
+    message: str,
+    *,
+    warnings: tuple[PreflightWarningCode, ...] = (),
+) -> JsonObject:
+    error: dict[str, JsonValue] = {"code": code, "message": message}
+    if warnings:
+        error["warnings"] = list(warnings)
     return {
         "request_id": request_id,
         "ok": False,
-        "error": {"code": code, "message": message},
+        "error": error,
     }
 
 

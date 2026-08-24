@@ -81,6 +81,8 @@ from qworker.preflight import (
     AuthSelection,
     PreflightFailure,
     RuntimeInfo,
+    normalize_server_capabilities,
+    safe_preflight_failure,
     select_auth,
 )
 
@@ -322,19 +324,16 @@ class QoderPreflightBackend:
                 operation="initialize",
                 credential_values=credential_values,
             )
-            raise PreflightFailure(diagnostic.code, diagnostic.message) from None
+            safe_diagnostic = safe_preflight_failure(diagnostic.code)
+            raise PreflightFailure(
+                safe_diagnostic.code, safe_diagnostic.message
+            ) from None
         assert server_info is not None
         raw_capabilities = server_info.get("capabilities", {})
         if not isinstance(raw_capabilities, Mapping):
             return ()
-        return tuple(
-            sorted(
-                key
-                for key in raw_capabilities
-                if isinstance(key, str)
-                and 0 < len(key) <= 128
-                and _redact(key, credential_values) == key
-            )
+        return normalize_server_capabilities(
+            tuple(key for key in raw_capabilities if isinstance(key, str))
         )
 
     async def local_login_status(self, runtime: RuntimeInfo) -> bool:

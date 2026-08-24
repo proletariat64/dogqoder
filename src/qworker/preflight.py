@@ -14,15 +14,19 @@ type AuthSource = Literal[
     "service_account",
     "qodercli",
 ]
+type PreflightWarningCode = Literal["qodercli_auth_reuse_failed"]
 
 _PERSONAL_ACCESS_TOKEN_ENV = "QODER_PERSONAL_ACCESS_TOKEN"
-_KNOWN_CREDENTIAL_ENV_VARS = (
-    _PERSONAL_ACCESS_TOKEN_ENV,
-    "QODER_SERVICE_ACCOUNT_KEY",
-    "QODERCN_PERSONAL_ACCESS_TOKEN",
-    "QODERCN_SERVICE_ACCOUNT_KEY",
-)
 _MAX_DIAGNOSTIC_CHARS = 512
+_SAFE_SERVER_CAPABILITIES = frozenset(("modelPolicy",))
+_PREFLIGHT_DIAGNOSTICS: dict[str, str] = {
+    "auth_required": "Qoder authentication is required.",
+    "initialize_timeout": "Qoder control initialization timed out.",
+    "invalid_request": "Qoder preflight configuration is invalid.",
+    "runtime_not_found": "Qoder runtime was not found.",
+    "runtime_incompatible": "Qoder runtime is incompatible.",
+    "sdk_protocol_error": "Qoder control initialization failed.",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,7 +64,7 @@ class DoctorResult:
     runtime_version: str | None = None
     auth_source: AuthSource | None = None
     capabilities: tuple[str, ...] = ()
-    warnings: tuple[str, ...] = ()
+    warnings: tuple[PreflightWarningCode, ...] = ()
     error: PreflightDiagnostic | None = None
 
     def to_json(self) -> dict[str, JsonValue]:
@@ -149,13 +153,13 @@ class RuntimePreflight:
         except ConfigError as error:
             return _failed(error.code, error.message, sdk_version=sdk_version)
 
-        credential_values = _credential_values(config, self._environ)
         try:
             runtime = await self._backend.resolve_runtime(config.runtime_path)
         except PreflightFailure as error:
+            diagnostic = safe_preflight_failure(error.code)
             return _failed(
-                error.code,
-                _safe_message(error.message, credential_values),
+                diagnostic.code,
+                diagnostic.message,
                 sdk_version=sdk_version,
             )
         except Exception:  # noqa: BLE001 -- backend details are not display-safe
@@ -168,9 +172,10 @@ class RuntimePreflight:
         try:
             auth = select_auth(config, self._environ)
         except PreflightFailure as error:
+            diagnostic = safe_preflight_failure(error.code)
             return _failed(
-                error.code,
-                _safe_message(error.message, credential_values),
+                diagnostic.code,
+                diagnostic.message,
                 sdk_version=sdk_version,
                 runtime=runtime,
             )
@@ -178,8 +183,12 @@ class RuntimePreflight:
         try:
             capabilities = await self._backend.initialize(cwd, runtime, auth)
         except PreflightFailure as error:
-            warnings: tuple[str, ...] = ()
-            if auth.source == "qodercli" and error.code == "initialize_timeout":
+            diagnostic = safe_preflight_failure(error.code)
+            warnings: tuple[PreflightWarningCode, ...] = ()
+            if (
+                auth.source == "qodercli"
+                and diagnostic.code == "initialize_timeout"
+            ):
                 try:
                     status_ok = await self._backend.local_login_status(runtime)
                 except Exception:  # noqa: BLE001 -- status output is never exposed
@@ -187,8 +196,8 @@ class RuntimePreflight:
                 if status_ok:
                     warnings = ("qodercli_auth_reuse_failed",)
             return _failed(
-                error.code,
-                _safe_message(error.message, credential_values),
+                diagnostic.code,
+                diagnostic.message,
                 sdk_version=sdk_version,
                 runtime=runtime,
                 auth=auth,
@@ -209,7 +218,7 @@ class RuntimePreflight:
             runtime_path=runtime.recorded_path,
             runtime_version=runtime.version,
             auth_source=auth.source,
-            capabilities=tuple(sorted(set(capabilities))),
+            capabilities=normalize_server_capabilities(capabilities),
         )
 
 
@@ -232,6 +241,32 @@ def select_auth(
     )
 
 
+def normalize_server_capabilities(capabilities: tuple[str, ...]) -> tuple[str, ...]:
+    """Expose only stable, credential-free capability identifiers."""
+
+    return tuple(sorted(set(capabilities) & _SAFE_SERVER_CAPABILITIES))
+
+
+def safe_preflight_failure(code: str) -> PreflightDiagnostic:
+    """Normalize arbitrary backend failures to fixed safe diagnostics."""
+
+    if code not in _PREFLIGHT_DIAGNOSTICS:
+        code = "sdk_protocol_error"
+    return PreflightDiagnostic(code, _PREFLIGHT_DIAGNOSTICS[code])
+
+
+def normalize_preflight_warnings(
+    warnings: tuple[str, ...],
+) -> tuple[PreflightWarningCode, ...]:
+    """Keep only stable warning codes safe for display and RPC."""
+
+    return (
+        ("qodercli_auth_reuse_failed",)
+        if "qodercli_auth_reuse_failed" in warnings
+        else ()
+    )
+
+
 def _failed(
     code: str,
     message: str,
@@ -239,7 +274,7 @@ def _failed(
     sdk_version: str | None = None,
     runtime: RuntimeInfo | None = None,
     auth: AuthSelection | None = None,
-    warnings: tuple[str, ...] = (),
+    warnings: tuple[PreflightWarningCode, ...] = (),
 ) -> DoctorResult:
     return DoctorResult(
         ok=False,
@@ -250,23 +285,6 @@ def _failed(
         warnings=warnings,
         error=PreflightDiagnostic(code, _bounded(message)),
     )
-
-
-def _credential_values(
-    config: EffectiveConfig,
-    environ: Mapping[str, str],
-) -> tuple[str, ...]:
-    names = set(_KNOWN_CREDENTIAL_ENV_VARS)
-    if config.service_account_env is not None:
-        names.add(config.service_account_env)
-    return tuple(value for name in names if (value := environ.get(name)))
-
-
-def _safe_message(message: str, credential_values: tuple[str, ...]) -> str:
-    safe = message
-    for value in credential_values:
-        safe = safe.replace(value, "[REDACTED]")
-    return _bounded(safe)
 
 
 def _bounded(message: str) -> str:
