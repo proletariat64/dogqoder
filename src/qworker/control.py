@@ -1,6 +1,7 @@
 """SDK-independent contracts for live worker control."""
 
 import asyncio
+import json
 import math
 import os
 import re
@@ -13,7 +14,7 @@ from typing import Literal, cast
 from jsonschema.exceptions import SchemaError, ValidationError
 from jsonschema.validators import validator_for
 
-from qworker.store import JsonValue
+from qworker.store import JsonValue, is_safe_metadata
 
 type SteeringPriority = Literal["now", "next", "later"]
 type ApprovalKind = Literal["tool_permission", "elicitation", "mcp_oauth"]
@@ -31,15 +32,9 @@ _CREDENTIAL_ENV_VARS = (
     "QODERCN_PERSONAL_ACCESS_TOKEN",
     "QODERCN_SERVICE_ACCOUNT_KEY",
 )
-_IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _KEYED_CREDENTIAL = re.compile(
     r"\b(?:api[_ -]?key|access[_ -]?token|token|secret|credential|password|"
     r"authorization)\b(?:\s*[:=]\s*|\s+)[^\s,;]+",
-    re.IGNORECASE,
-)
-_CREDENTIAL_MARKER = re.compile(
-    r"(?:^sk[-_]|^pk[-_]|^bearer[._ -]|api[_-]?key|access[_-]?token|token|"
-    r"secret|credential|password|authorization)",
     re.IGNORECASE,
 )
 _INLINE_CREDENTIAL = re.compile(
@@ -87,6 +82,13 @@ class ElicitationDecision:
     content: dict[str, JsonValue] | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ElicitationSchemaSnapshot:
+    """Immutable, bounded JSON Schema retained only for one live callback."""
+
+    encoded: str
+
+
 type ApprovalDecision = PermissionDecision | ElicitationDecision
 type PermissionCallback = Callable[
     [PermissionRequest], Coroutine[object, object, PermissionDecision]
@@ -113,6 +115,7 @@ class PendingApproval:
     attempt: int
     kind: ApprovalKind
     request: PermissionRequest | ElicitationRequest
+    schema_snapshot: ElicitationSchemaSnapshot | None
     display: dict[str, JsonValue]
     future: asyncio.Future[ApprovalDecision]
 
@@ -121,6 +124,8 @@ def approval_display(
     request_id: str,
     attempt: int,
     request: PermissionRequest | ElicitationRequest,
+    *,
+    schema_snapshot: ElicitationSchemaSnapshot | None = None,
 ) -> dict[str, JsonValue] | None:
     """Build one bounded, allowlisted, durable-safe approval display record."""
 
@@ -152,7 +157,7 @@ def approval_display(
         "prompt": prompt,
         "choices": ["accept", "decline", "cancel"],
     }
-    fields, required_fields = _schema_display(request.requested_schema)
+    fields, required_fields = _schema_display(schema_snapshot)
     if request.mode == "form" and fields:
         display["fields"] = fields
     if request.mode == "form" and required_fields:
@@ -179,17 +184,33 @@ def safe_display_text(value: str) -> str:
 def safe_identifier(value: str) -> bool:
     """Accept only compact ASCII metadata with no credential marker."""
 
-    return (
-        _IDENTIFIER.fullmatch(value) is not None
-        and not _CREDENTIAL_MARKER.search(value)
+    return is_safe_metadata(value)
+
+
+def snapshot_elicitation_schema(
+    requested_schema: Mapping[str, object] | None,
+) -> ElicitationSchemaSnapshot | None:
+    """Copy and validate a live schema before its approval becomes pending."""
+
+    if requested_schema is None:
+        return None
+    try:
+        schema = _bounded_json_schema(requested_schema)
+        validator_type = validator_for(schema)
+        validator_type.check_schema(schema)
+    except (SchemaError, TypeError, ValueError):
+        raise ValueError("Elicitation form schema is unsupported.") from None
+    return ElicitationSchemaSnapshot(
+        json.dumps(schema, sort_keys=True, separators=(",", ":"))
     )
 
 
 def _schema_display(
-    schema: Mapping[str, object] | None,
+    schema_snapshot: ElicitationSchemaSnapshot | None,
 ) -> tuple[list[JsonValue], list[JsonValue]]:
-    if schema is None:
+    if schema_snapshot is None:
         return [], []
+    schema = _schema_from_snapshot(schema_snapshot)
     properties = schema.get("properties")
     if not isinstance(properties, Mapping):
         return [], []
@@ -234,6 +255,8 @@ def _schema_display(
 def parse_approval_response(
     request: PermissionRequest | ElicitationRequest,
     response: Mapping[str, JsonValue],
+    *,
+    schema_snapshot: ElicitationSchemaSnapshot | None = None,
 ) -> ApprovalDecision:
     """Validate one RPC response against its live request shape."""
 
@@ -266,25 +289,33 @@ def parse_approval_response(
     content = response.get("content")
     if not isinstance(content, dict):
         raise TypeError("Accepted elicitation content must be an object.")
-    _validate_elicitation_content(content, request.requested_schema)
+    _validate_elicitation_content(content, schema_snapshot)
     return ElicitationDecision("accept", content)
 
 
 def _validate_elicitation_content(
     content: Mapping[str, JsonValue],
-    requested_schema: Mapping[str, object] | None,
+    schema_snapshot: ElicitationSchemaSnapshot | None,
 ) -> None:
-    if requested_schema is None:
+    if schema_snapshot is None:
         return
     try:
-        schema = _bounded_json_schema(requested_schema)
+        schema = _schema_from_snapshot(schema_snapshot)
         validator_type = validator_for(schema)
-        validator_type.check_schema(schema)
         validator_type(schema).validate(dict(content))
-    except (SchemaError, TypeError, ValidationError, ValueError):
+    except (TypeError, ValidationError, ValueError):
         raise ValueError(
             "Elicitation content does not match the requested form schema."
         ) from None
+
+
+def _schema_from_snapshot(
+    schema_snapshot: ElicitationSchemaSnapshot,
+) -> dict[str, JsonValue]:
+    decoded: object = json.loads(schema_snapshot.encoded)
+    if not isinstance(decoded, dict):
+        raise TypeError("Elicitation form schema snapshot must be an object.")
+    return cast(dict[str, JsonValue], decoded)
 
 
 def _bounded_json_schema(value: object) -> dict[str, JsonValue]:

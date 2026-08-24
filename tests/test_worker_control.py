@@ -513,6 +513,63 @@ async def test_pending_status_and_events_expose_only_safe_approval_display(
     await supervisor.close()
 
 
+async def test_schema_display_never_persists_sensitive_property_names(
+    tmp_path: Path,
+) -> None:
+    supervisor, transport, worker_id, store = await _spawn_running(tmp_path)
+    callbacks = transport.callbacks
+    assert callbacks is not None
+    aws_shaped_name = "AKIA1234567890ABCDEF"
+    jwt_shaped_name = "abcd.efgh.ijkl"
+    marker_name = "password"
+    elicitation = asyncio.create_task(
+        callbacks.request_elicitation(
+            ElicitationRequest(
+                server_name="safe-server",
+                mode="form",
+                display_message="Choose a region.",
+                requested_schema={
+                    "type": "object",
+                    "properties": {
+                        "region": {"type": "string"},
+                        aws_shaped_name: {"type": "string"},
+                        jwt_shaped_name: {"type": "string"},
+                        marker_name: {"type": "string"},
+                    },
+                },
+            )
+        )
+    )
+    for _ in range(20):
+        status = await supervisor.status(worker_id)
+        if status["state"] == "requires_action":
+            break
+        await asyncio.sleep(0)
+    pending = status["pending_approvals"]
+    assert isinstance(pending, list)
+    assert len(pending) == 1
+    assert isinstance(pending[0], dict)
+    assert pending[0]["fields"] == ["region:string"]
+    request_id = pending[0]["request_id"]
+    assert isinstance(request_id, str)
+
+    requested = [
+        event
+        for event in await store.events_since(worker_id)
+        if event.type == "approval.requested"
+    ][-1]
+    assert requested.payload["fields"] == ["region:string"]
+    with sqlite3.connect(store.database_path) as connection:
+        durable = json.dumps(connection.execute("SELECT * FROM events").fetchall())
+    for sensitive_name in (aws_shaped_name, jwt_shaped_name, marker_name):
+        assert sensitive_name not in durable
+
+    await supervisor.respond(worker_id, request_id, {"action": "cancel"})
+    assert (await elicitation).action == "cancel"
+    transport.finish.set()
+    await supervisor.close()
+
+
 async def test_elicitation_response_must_match_live_schema_and_mode(
     tmp_path: Path,
 ) -> None:
@@ -619,6 +676,60 @@ async def test_elicitation_response_must_match_live_schema_and_mode(
     assert "additionalProperties" not in durable
     assert "minLength" not in durable
     assert "minimum" not in durable
+
+    transport.finish.set()
+    await supervisor.close()
+
+
+async def test_elicitation_validation_uses_ingress_schema_snapshot(
+    tmp_path: Path,
+) -> None:
+    supervisor, transport, worker_id, store = await _spawn_running(tmp_path)
+    callbacks = transport.callbacks
+    assert callbacks is not None
+    source_schema: dict[str, object] = {
+        "type": "object",
+        "properties": {"region": {"type": "string"}},
+        "required": ["region"],
+        "additionalProperties": False,
+    }
+    elicitation = asyncio.create_task(
+        callbacks.request_elicitation(
+            ElicitationRequest(
+                server_name="safe-server",
+                mode="form",
+                display_message="Choose a region.",
+                requested_schema=source_schema,
+            )
+        )
+    )
+    for _ in range(20):
+        if (await supervisor.status(worker_id))["state"] == "requires_action":
+            break
+        await asyncio.sleep(0)
+    request_id = await _latest_request_id(store, worker_id)
+
+    source_schema.clear()
+    with pytest.raises(SupervisorError) as invalid:
+        await supervisor.respond(
+            worker_id,
+            request_id,
+            {"action": "accept", "content": {"unexpected": 42}},
+        )
+    assert invalid.value.code == "invalid_request"
+    assert elicitation.done() is False
+    assert (await supervisor.status(worker_id))["state"] == "requires_action"
+
+    await supervisor.respond(
+        worker_id,
+        request_id,
+        {"action": "accept", "content": {"region": "cn"}},
+    )
+    assert (await elicitation).content == {"region": "cn"}
+    with sqlite3.connect(store.database_path) as connection:
+        durable = json.dumps(connection.execute("SELECT * FROM events").fetchall())
+    assert "additionalProperties" not in durable
+    assert "unexpected" not in durable
 
     transport.finish.set()
     await supervisor.close()

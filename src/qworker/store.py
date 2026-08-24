@@ -116,15 +116,17 @@ def _approval_choices(value: JsonValue) -> bool:
 def _display_fields(value: JsonValue) -> bool:
     if not isinstance(value, list) or len(value) > 32:
         return False
-    return all(
-        isinstance(item, str)
-        and re.fullmatch(
-            r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}:(?:array|boolean|integer|null|number|object|string|value)",
+    for item in value:
+        if not isinstance(item, str):
+            return False
+        matched = re.fullmatch(
+            r"(?P<name>[A-Za-z0-9][A-Za-z0-9._:-]{0,127}):"
+            r"(?:array|boolean|integer|null|number|object|string|value)",
             item,
         )
-        is not None
-        for item in value
-    )
+        if matched is None or not is_safe_metadata(matched.group("name")):
+            return False
+    return True
 
 
 def _required_display_fields(value: JsonValue) -> bool:
@@ -181,7 +183,7 @@ class _ResultBudget:
     text_chars: int = _MAX_RESULT_TEXT_CHARS
 
 
-def _safe_metadata(value: JsonValue) -> bool:
+def is_safe_metadata(value: JsonValue) -> bool:
     """Accept identifier-shaped metadata, never free-form text or credentials."""
 
     if not isinstance(value, str) or _METADATA.fullmatch(value) is None:
@@ -238,9 +240,9 @@ def _canonical_workspace(cwd: Path) -> Path:
     return canonical_cwd
 
 
-_IDENTIFIER = _safe_metadata
-_CODE = _safe_metadata
-_MODEL = _safe_metadata
+_IDENTIFIER = is_safe_metadata
+_CODE = is_safe_metadata
+_MODEL = is_safe_metadata
 _PATH = _absolute_path
 _RUNTIME_VERSION = _safe_runtime_version
 _ROLE = _one_of("coder", "auditor")

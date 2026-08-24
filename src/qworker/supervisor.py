@@ -14,6 +14,7 @@ from qworker.control import (
     ControlCallbacks,
     ElicitationDecision,
     ElicitationRequest,
+    ElicitationSchemaSnapshot,
     PendingApproval,
     PermissionDecision,
     PermissionRequest,
@@ -21,6 +22,7 @@ from qworker.control import (
     approval_display,
     new_request_id,
     parse_approval_response,
+    snapshot_elicitation_schema,
 )
 from qworker.domain import AuditContract, AuditResult
 from qworker.lifecycle import WorkerRecord
@@ -228,7 +230,11 @@ class Supervisor:
                     "Approval belongs to an attempt that is no longer live.",
                 )
             try:
-                decision = parse_approval_response(pending.request, response)
+                decision = parse_approval_response(
+                    pending.request,
+                    response,
+                    schema_snapshot=pending.schema_snapshot,
+                )
             except (TypeError, ValueError) as error:
                 raise SupervisorError("invalid_request", str(error)) from None
             status = _approval_status(decision)
@@ -469,8 +475,26 @@ class Supervisor:
                 if isinstance(request, PermissionRequest)
                 else "elicitation"
             )
+            schema_snapshot: ElicitationSchemaSnapshot | None = None
+            if isinstance(request, ElicitationRequest):
+                try:
+                    schema_snapshot = snapshot_elicitation_schema(
+                        request.requested_schema
+                    )
+                except (TypeError, ValueError):
+                    return default
+                request = ElicitationRequest(
+                    server_name=request.server_name,
+                    mode=request.mode,
+                    display_message=request.display_message,
+                )
             request_id = new_request_id()
-            display = approval_display(request_id, attempt, request)
+            display = approval_display(
+                request_id,
+                attempt,
+                request,
+                schema_snapshot=schema_snapshot,
+            )
             if display is None:
                 return default
             pending = PendingApproval(
@@ -479,6 +503,7 @@ class Supervisor:
                 attempt=attempt,
                 kind=kind,
                 request=request,
+                schema_snapshot=schema_snapshot,
                 display=display,
                 future=asyncio.get_running_loop().create_future(),
             )
