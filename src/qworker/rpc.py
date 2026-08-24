@@ -730,6 +730,7 @@ async def run_server(socket_path: Path, state_dir: Path) -> None:
         QoderPreflightBackend,
         create_coder_transport,
         create_default_transport,
+        create_resumed_coder_transport,
         create_resumed_transport,
     )
     from qworker.store import WorkerStore
@@ -741,6 +742,7 @@ async def run_server(socket_path: Path, state_dir: Path) -> None:
         sdk_version=version("qoder-agent-sdk"),
         preflight=preflight.run,
         resume_transport_factory=create_resumed_transport,
+        coder_resume_transport_factory=create_resumed_coder_transport,
         coder_transport_factory=create_coder_transport,
     )
     server = RPCServer(supervisor, socket_path)

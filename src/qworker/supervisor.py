@@ -93,6 +93,7 @@ class Supervisor:
         runtime_version: str | None = None,
         preflight: PreflightRunner | None = None,
         resume_transport_factory: ResumeTransportFactory | None = None,
+        coder_resume_transport_factory: ResumeTransportFactory | None = None,
         coder_transport_factory: TransportFactory | None = None,
         settlement_timeout: float = 5.0,
         stop_timeout: float = _MAX_STOP_TIMEOUT,
@@ -106,6 +107,7 @@ class Supervisor:
         self._runtime_version = runtime_version
         self._preflight = preflight
         self._resume_transport_factory = resume_transport_factory
+        self._coder_resume_transport_factory = coder_resume_transport_factory
         self._coder_transport_factory = coder_transport_factory or transport_factory
         self._settlement_timeout = settlement_timeout
         self._stop_timeout = min(stop_timeout, _MAX_STOP_TIMEOUT)
@@ -246,7 +248,11 @@ class Supervisor:
                     "resume_not_possible",
                     "Worker has no stored Qoder session.",
                 )
-            resume_factory = self._resume_transport_factory
+            resume_factory = (
+                self._coder_resume_transport_factory
+                if worker.role == "coder"
+                else self._resume_transport_factory
+            )
             if resume_factory is None:
                 raise SupervisorError(
                     "resume_not_possible",
@@ -267,11 +273,18 @@ class Supervisor:
 
             session_id = worker.session_id
             attempt = await self._store.start_attempt(worker_id)
-            contract = AuditContract(
-                objective=_RESUME_RECOVERY_MESSAGE,
-                cwd=canonical_cwd,
-                requested_model=worker.requested_model,
-            )
+            if worker.role == "coder":
+                contract: WorkerContract = CoderContract(
+                    objective=_RESUME_RECOVERY_MESSAGE,
+                    cwd=canonical_cwd,
+                    requested_model=worker.requested_model,
+                )
+            else:
+                contract = AuditContract(
+                    objective=_RESUME_RECOVERY_MESSAGE,
+                    cwd=canonical_cwd,
+                    requested_model=worker.requested_model,
+                )
 
             def resumed_transport_factory(cwd: Path) -> QoderTransport:
                 return resume_factory(cwd, session_id)

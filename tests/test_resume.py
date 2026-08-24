@@ -11,9 +11,9 @@ from qworker.cli import run
 from qworker.control import PermissionRequest
 from qworker.domain import AuditContract
 from qworker.events import AdapterEvent, ResultEvent
-from qworker.lifecycle import WorkerState
+from qworker.lifecycle import WorkerRole, WorkerState
 from qworker.model_policy import AvailableModel
-from qworker.qoder_sdk import build_auditor_options
+from qworker.qoder_sdk import build_auditor_options, build_configured_coder_options
 from qworker.rpc import RPCClientError, RPCServer, call
 from qworker.store import WorkerStore
 from qworker.supervisor import Supervisor, SupervisorError
@@ -35,6 +35,31 @@ class GatedResumeTransport(FakeQoderTransport):
         )
         self._gate = gate
         self.session_id = session_id
+
+    async def messages(self) -> AsyncIterator[AdapterEvent]:
+        await self._gate.wait()
+        async for event in super().messages():
+            yield event
+
+
+class GatedCoderResumeTransport(FakeQoderTransport):
+    def __init__(self, gate: asyncio.Event, *, session_id: str) -> None:
+        report = (
+            '{"outcome":"completed","summary":"recovered coder",'
+            '"files":[],"validation":["fake passed"],"risks":[]}'
+        )
+        super().__init__(
+            models=(AvailableModel(value="Qwen3.8-Max", enabled=True),),
+            events=(
+                ResultEvent(
+                    session_id=session_id,
+                    is_error=False,
+                    result=report,
+                    model_usage=("Qwen3.8-Max",),
+                ),
+            ),
+        )
+        self._gate = gate
 
     async def messages(self) -> AsyncIterator[AdapterEvent]:
         await self._gate.wait()
@@ -85,12 +110,13 @@ async def _create_terminal_worker(
     *,
     state: WorkerState,
     session_id: str | None = "session-resume",
+    role: WorkerRole = "auditor",
 ) -> str:
     worker = await store.create_worker(
-        role="auditor",
+        role=role,
         cwd=cwd,
-        write_capability="read_only",
-        requested_model="qwen-auditor",
+        write_capability=("shared_workspace" if role == "coder" else "read_only"),
+        requested_model="qwen-coder" if role == "coder" else "qwen-auditor",
         runtime_path="bundled",
         sdk_version="1.0.13",
     )
@@ -139,6 +165,83 @@ def test_resume_transport_sets_public_sdk_option(tmp_path: Path) -> None:
 
     assert options.cwd == tmp_path
     assert options.resume == "session-resume"
+
+
+def test_resumed_coder_options_keep_coder_policy(tmp_path: Path) -> None:
+    user_config = tmp_path / "config.toml"
+    user_config.write_text(
+        "[auth]\n"
+        "reuse_qodercli = true\n"
+        "[policy]\n"
+        'coder_permission_mode = "acceptEdits"\n'
+        'coder_denied_tools = ["Bash"]\n',
+        encoding="utf-8",
+    )
+
+    options = build_configured_coder_options(
+        tmp_path,
+        user_path=user_config,
+        environ={},
+        resume="coder-session",
+    )
+
+    assert options.resume == "coder-session"
+    assert options.tools == {"type": "preset", "preset": "qodercli"}
+    assert options.permission_mode == "acceptEdits"
+    assert options.disallowed_tools == ["Bash"]
+    assert options.allow_dangerously_skip_permissions is False
+    assert options.setting_sources == []
+
+
+async def test_stored_coder_resumes_with_coder_contract_and_factory(
+    tmp_path: Path,
+) -> None:
+    store = WorkerStore(tmp_path / "state")
+    worker_id = await _create_terminal_worker(
+        store,
+        tmp_path,
+        state="failed",
+        role="coder",
+    )
+    gate = asyncio.Event()
+    resumed = GatedCoderResumeTransport(gate, session_id="session-resume")
+    coder_constructions: list[tuple[Path, str]] = []
+    auditor_constructions: list[tuple[Path, str]] = []
+
+    def auditor_resume_factory(
+        cwd: Path, session_id: str
+    ) -> GatedResumeTransport:
+        auditor_constructions.append((cwd, session_id))
+        raise AssertionError("coder must not use auditor resume policy")
+
+    def coder_resume_factory(
+        cwd: Path, session_id: str
+    ) -> GatedCoderResumeTransport:
+        coder_constructions.append((cwd, session_id))
+        return resumed
+
+    supervisor = Supervisor(
+        store,
+        lambda _: FakeQoderTransport.successful_audit(model="Qwen3.8-Max"),
+        sdk_version="1.0.13",
+        resume_transport_factory=auditor_resume_factory,
+        coder_resume_transport_factory=coder_resume_factory,
+    )
+
+    accepted = await supervisor.resume(worker_id)
+    while not resumed.sent_prompts:
+        await asyncio.sleep(0)
+
+    assert accepted["role"] == "coder"
+    assert accepted["attempt"] == 2
+    assert coder_constructions == [(tmp_path.resolve(), "session-resume")]
+    assert auditor_constructions == []
+    recovery_prompt = resumed.sent_prompts[0]
+    assert "Qoder shared-workspace coder" in recovery_prompt
+    assert "prior Qoder process ended" in recovery_prompt
+
+    gate.set()
+    await supervisor.close()
 
 
 async def test_failed_worker_resumes_as_new_attempt(tmp_path: Path) -> None:

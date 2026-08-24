@@ -218,6 +218,16 @@ def create_resumed_transport(cwd: Path, session_id: str) -> "QoderSDKTransport":
     return QoderSDKTransport(QoderSDKClient(options=options))
 
 
+def create_resumed_coder_transport(
+    cwd: Path,
+    session_id: str,
+) -> "QoderSDKTransport":
+    """Create a fresh resumed coder transport under the coder policy."""
+
+    options = build_configured_coder_options(cwd, resume=session_id)
+    return QoderSDKTransport(QoderSDKClient(options=options))
+
+
 def build_configured_auditor_options(
     cwd: Path,
     *,
