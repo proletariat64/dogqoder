@@ -112,7 +112,7 @@ async def test_overlap_warning_is_visible_durable_and_never_rejects_spawn(
     )
 
     warning = {
-        "code": "shared_workspace_overlap",
+        "code": "write_conflict_warning",
         "worker_id": first["worker_id"],
         "cwd": str(workspace),
         "relation": "same",
@@ -122,7 +122,7 @@ async def test_overlap_warning_is_visible_durable_and_never_rejects_spawn(
     assert second["warnings"] == [warning]
     second_status = await supervisor.status(str(second["worker_id"]))
     assert second_status["write_capability"] == "shared_workspace"
-    assert second_status["warnings"] == ["shared_workspace_overlap"]
+    assert second_status["warnings"] == ["write_conflict_warning"]
     warning_events = [
         event
         async for event in supervisor.watch(

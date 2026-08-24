@@ -221,7 +221,7 @@ class Supervisor:
                 continue
             warnings.append(
                 {
-                    "code": "shared_workspace_overlap",
+                    "code": "write_conflict_warning",
                     "worker_id": worker.worker_id,
                     "cwd": str(worker.cwd),
                     "relation": relation,
@@ -411,7 +411,13 @@ class Supervisor:
                 "cancelled": cancelled,
             },
         )
-        return {"message_id": message_id, "cancelled": cancelled}
+        response: dict[str, JsonValue] = {
+            "message_id": message_id,
+            "cancelled": cancelled,
+        }
+        if not cancelled:
+            response["code"] = "message_not_cancellable"
+        return response
 
     async def stop(
         self,

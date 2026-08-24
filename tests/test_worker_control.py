@@ -249,7 +249,13 @@ async def test_each_priority_uses_stable_uuid_and_preserves_cancellation_result(
 
     transport.cancellation_results.append(cancelled)
     cancellation = await supervisor.cancel_message(worker_id, message_ids[2])
-    assert cancellation == {"message_id": message_ids[2], "cancelled": cancelled}
+    expected_cancellation: dict[str, JsonValue] = {
+        "message_id": message_ids[2],
+        "cancelled": cancelled,
+    }
+    if not cancelled:
+        expected_cancellation["code"] = "message_not_cancellable"
+    assert cancellation == expected_cancellation
 
     events = await store.events_since(worker_id)
     assert [event.type for event in events[4:]] == [
@@ -937,6 +943,7 @@ async def test_cli_controls_live_worker_without_putting_bodies_in_argv(
     assert json.loads(stdout.getvalue()) == {
         "message_id": steered["message_id"],
         "cancelled": False,
+        "code": "message_not_cancellable",
     }
 
     callbacks = transport.callbacks

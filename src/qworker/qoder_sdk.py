@@ -682,7 +682,12 @@ class QoderSDKTransport:
                 return PermissionResultDeny(
                     message="Tool permission policy is unavailable."
                 )
-            policy_decision = await policy_callback(tool_name, tool_input, context)
+            try:
+                policy_decision = await policy_callback(tool_name, tool_input, context)
+            except Exception:  # noqa: BLE001 -- policy failures deny permission
+                return PermissionResultDeny(
+                    message="Tool permission policy failed closed."
+                )
             if isinstance(policy_decision, PermissionResultDeny):
                 return policy_decision
             display_message = (

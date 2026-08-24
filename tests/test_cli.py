@@ -180,7 +180,7 @@ async def test_json_coder_spawn_uses_role_default_and_reports_overlap(
     assert second["role"] == "coder"
     assert second["warnings"] == [
         {
-            "code": "shared_workspace_overlap",
+            "code": "write_conflict_warning",
             "worker_id": first["worker_id"],
             "cwd": str(tmp_path),
             "relation": "same",
