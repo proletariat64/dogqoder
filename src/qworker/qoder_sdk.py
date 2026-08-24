@@ -56,6 +56,7 @@ from qoder_agent_sdk import (
 from qoder_agent_sdk import (
     ElicitationResult as SDKElicitationResult,
 )
+from qoder_agent_sdk.types import ToolsPreset
 
 from qworker.auditor_policy import AuditorToolPolicy
 from qworker.config import ConfigError, load_config
@@ -161,10 +162,52 @@ def build_auditor_options(
     )
 
 
+def build_coder_options(
+    cwd: str | Path,
+    *,
+    auth: AuthOptions | None = None,
+    cli_path: Path | None = None,
+    resume: str | None = None,
+    permission_mode: Literal["dontAsk", "default", "acceptEdits"] = "acceptEdits",
+    disallowed_tools: Sequence[str] = (),
+) -> QoderAgentOptions:
+    """Build isolated SDK options for a shared-workspace coder."""
+
+    if auth is not None and not isinstance(
+        auth,
+        (AccessTokenAuthOptions, QoderCLIAuthOptions, ServiceAccountAuthOptions),
+    ):
+        raise TypeError("Use a qoder_agent_sdk SDK auth helper.")
+
+    default_tools: ToolsPreset = {"type": "preset", "preset": "qodercli"}
+    return QoderAgentOptions(
+        auth=auth,
+        cwd=cwd,
+        cli_path=cli_path,
+        resume=resume,
+        setting_sources=[],
+        tools=default_tools,
+        disallowed_tools=list(disallowed_tools),
+        permission_mode=permission_mode,
+        allow_dangerously_skip_permissions=False,
+        max_turns=24,
+        control_request_timeout_ms=30_000,
+        load_timeout_ms=30_000,
+        max_buffer_size=16 * 1024 * 1024,
+    )
+
+
 def create_default_transport(cwd: Path) -> "QoderSDKTransport":
     """Create production transport from the same config/auth policy as preflight."""
 
     options = build_configured_auditor_options(cwd)
+    return QoderSDKTransport(QoderSDKClient(options=options))
+
+
+def create_coder_transport(cwd: Path) -> "QoderSDKTransport":
+    """Create a production coder transport with explicit isolated settings."""
+
+    options = build_configured_coder_options(cwd)
     return QoderSDKTransport(QoderSDKClient(options=options))
 
 
@@ -219,6 +262,55 @@ def build_configured_auditor_options(
         auth=_sdk_auth(auth),
         cli_path=runtime_path,
         resume=resume,
+    )
+
+
+def build_configured_coder_options(
+    cwd: Path,
+    *,
+    user_path: Path | None = None,
+    environ: Mapping[str, str] | None = None,
+    resume: str | None = None,
+) -> QoderAgentOptions:
+    """Build coder options from restrictive effective project policy."""
+
+    selected_environment = os.environ if environ is None else environ
+    try:
+        config = load_config(cwd, user_path=user_path)
+        auth = select_auth(config, selected_environment)
+        if config.runtime_path is None:
+            runtime_path = _bundled_runtime_path()
+        else:
+            try:
+                runtime_path = config.runtime_path.resolve(strict=True)
+            except OSError:
+                raise PreflightFailure(
+                    "runtime_not_found", "Configured Qoder runtime was not found."
+                ) from None
+            if not runtime_path.is_file() or not os.access(runtime_path, os.X_OK):
+                raise PreflightFailure(
+                    "runtime_not_found",
+                    "Configured Qoder runtime is not executable.",
+                )
+    except ConfigError as error:
+        raise AdapterDiagnostic("invalid_request", error.message) from None
+    except PreflightFailure as error:
+        if error.code not in {
+            "auth_required",
+            "runtime_not_found",
+            "runtime_incompatible",
+        }:
+            raise AdapterDiagnostic("sdk_protocol_error", error.message) from None
+        raise AdapterDiagnostic(
+            cast(AdapterDiagnosticCode, error.code), error.message
+        ) from None
+    return build_coder_options(
+        cwd,
+        auth=_sdk_auth(auth),
+        cli_path=runtime_path,
+        resume=resume,
+        permission_mode=config.policy.coder_permission_mode,
+        disallowed_tools=config.policy.coder_denied_tools,
     )
 
 

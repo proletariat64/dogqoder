@@ -4,11 +4,12 @@ import asyncio
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, cast
 
 from qworker.auditor import ForegroundAuditor, TransportFactory
+from qworker.coder import CoderContract, CoderResult, ForegroundCoder
 from qworker.control import (
     ApprovalDecision,
     ApprovalKind,
@@ -35,6 +36,7 @@ from qworker.preflight import (
 )
 from qworker.store import AttemptChangedError, EventRecord, JsonValue, WorkerStore
 from qworker.transport import QoderTransport
+from qworker.workspace import canonical_workspace, classify_workspace_overlap
 
 _TERMINAL_STATES = frozenset(("completed", "failed", "cancelled", "lost"))
 _STEERING_PRIORITIES = frozenset(("now", "next", "later"))
@@ -46,6 +48,8 @@ _RESUME_RECOVERY_MESSAGE = (
 )
 
 type ResumeTransportFactory = Callable[[Path, str], QoderTransport]
+type WorkerContract = AuditContract | CoderContract
+type WorkerResult = AuditResult | CoderResult
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +93,7 @@ class Supervisor:
         runtime_version: str | None = None,
         preflight: PreflightRunner | None = None,
         resume_transport_factory: ResumeTransportFactory | None = None,
+        coder_transport_factory: TransportFactory | None = None,
         settlement_timeout: float = 5.0,
         stop_timeout: float = _MAX_STOP_TIMEOUT,
     ) -> None:
@@ -101,6 +106,7 @@ class Supervisor:
         self._runtime_version = runtime_version
         self._preflight = preflight
         self._resume_transport_factory = resume_transport_factory
+        self._coder_transport_factory = coder_transport_factory or transport_factory
         self._settlement_timeout = settlement_timeout
         self._stop_timeout = min(stop_timeout, _MAX_STOP_TIMEOUT)
         self._tasks: dict[str, asyncio.Task[None]] = {}
@@ -113,11 +119,13 @@ class Supervisor:
         self._event_conditions: dict[str, asyncio.Condition] = {}
         self._closed = False
 
-    async def spawn(self, contract: AuditContract) -> dict[str, JsonValue]:
-        """Durably accept an audit and return before its transport completes."""
+    async def spawn(self, contract: WorkerContract) -> dict[str, JsonValue]:
+        """Durably accept one worker and return before transport completion."""
 
         if self._closed:
             raise SupervisorError("supervisor_unavailable", "Supervisor is closed.")
+        if isinstance(contract, CoderContract):
+            contract = replace(contract, cwd=canonical_workspace(contract.cwd))
         sdk_version = self._sdk_version
         runtime_path = self._runtime_path
         runtime_version = self._runtime_version
@@ -146,15 +154,32 @@ class Supervisor:
         async with self._control_lock:
             if self._closed:
                 raise SupervisorError("supervisor_unavailable", "Supervisor is closed.")
+            role: Literal["auditor", "coder"] = (
+                "coder" if isinstance(contract, CoderContract) else "auditor"
+            )
+            write_capability: Literal["read_only", "shared_workspace"] = (
+                "shared_workspace" if role == "coder" else "read_only"
+            )
+            overlap_warnings = (
+                await self._shared_workspace_warnings(contract.cwd)
+                if role == "coder"
+                else []
+            )
             worker = await self._store.create_worker(
-                role="auditor",
+                role=role,
                 cwd=contract.cwd,
-                write_capability="read_only",
+                write_capability=write_capability,
                 requested_model=contract.requested_model,
                 runtime_path=runtime_path,
                 runtime_version=runtime_version,
                 sdk_version=sdk_version,
             )
+            for warning in overlap_warnings:
+                await self._append_event(
+                    worker.worker_id,
+                    "worker.warning",
+                    {"schema_version": 1, **warning},
+                )
             task = asyncio.create_task(
                 self._run_worker(worker.worker_id, worker.attempt, contract),
                 name=f"qworker:{worker.worker_id}",
@@ -165,13 +190,42 @@ class Supervisor:
                 self._task_finished(worker.worker_id, completed)
 
             task.add_done_callback(task_finished)
-            return {
+            accepted: dict[str, JsonValue] = {
                 "worker_id": worker.worker_id,
                 "state": worker.state,
                 "role": worker.role,
                 "cwd": str(worker.cwd),
-                "event_cursor": 1,
+                "event_cursor": await self._store.latest_event_cursor(worker.worker_id),
             }
+            if overlap_warnings:
+                accepted["warnings"] = cast(list[JsonValue], overlap_warnings)
+            return accepted
+
+    async def _shared_workspace_warnings(
+        self,
+        requested_cwd: Path,
+    ) -> list[dict[str, JsonValue]]:
+        warnings: list[dict[str, JsonValue]] = []
+        for worker_id in tuple(self._tasks):
+            worker = await self._store.get_worker(worker_id)
+            if (
+                worker is None
+                or worker.state in _TERMINAL_STATES
+                or worker.write_capability != "shared_workspace"
+            ):
+                continue
+            relation = classify_workspace_overlap(requested_cwd, worker.cwd)
+            if relation is None:
+                continue
+            warnings.append(
+                {
+                    "code": "shared_workspace_overlap",
+                    "worker_id": worker.worker_id,
+                    "cwd": str(worker.cwd),
+                    "relation": relation,
+                }
+            )
+        return warnings
 
     async def resume(self, worker_id: str) -> dict[str, JsonValue]:
         """Start a fresh process using one eligible worker's conversation history."""
@@ -683,12 +737,16 @@ class Supervisor:
         self,
         worker_id: str,
         attempt: int,
-        contract: AuditContract,
+        contract: WorkerContract,
         *,
         transport_factory: TransportFactory | None = None,
     ) -> None:
         initialized = False
-        selected_transport_factory = transport_factory or self._transport_factory
+        selected_transport_factory = transport_factory or (
+            self._coder_transport_factory
+            if isinstance(contract, CoderContract)
+            else self._transport_factory
+        )
 
         def owned_transport_factory(cwd: Path) -> QoderTransport:
             transport = selected_transport_factory(cwd)
@@ -733,13 +791,20 @@ class Supervisor:
             )
             initialized = True
 
-        auditor = ForegroundAuditor(
-            owned_transport_factory,
-            settlement_timeout=self._settlement_timeout,
-            on_initialized=on_initialized,
-        )
+        result: WorkerResult
         try:
-            result = await auditor.run(contract)
+            if isinstance(contract, CoderContract):
+                result = await ForegroundCoder(
+                    owned_transport_factory,
+                    settlement_timeout=self._settlement_timeout,
+                    on_initialized=on_initialized,
+                ).run(contract)
+            else:
+                result = await ForegroundAuditor(
+                    owned_transport_factory,
+                    settlement_timeout=self._settlement_timeout,
+                    on_initialized=on_initialized,
+                ).run(contract)
         except asyncio.CancelledError:
             missing_state: Literal["cancelled", "lost"] = (
                 "cancelled" if (worker_id, attempt) in self._stop_requests else "lost"
@@ -800,12 +865,19 @@ class Supervisor:
         self,
         worker_id: str,
         attempt: int,
-        result: AuditResult,
+        result: WorkerResult,
         initialized: bool,
     ) -> None:
         """Durably commit an accepted result through its result-derived terminal state."""
 
         await self._complete_live_attempt(worker_id, attempt)
+        worker = await self._require_worker(worker_id)
+        new_result_warnings = tuple(
+            warning for warning in result.warnings if warning not in worker.warnings
+        )
+        persisted_warnings = tuple(dict.fromkeys((*worker.warnings, *result.warnings)))
+        if persisted_warnings != result.warnings:
+            result = replace(result, warnings=persisted_warnings)
         await self._store.record_result(
             worker_id,
             outcome=result.outcome,
@@ -817,7 +889,7 @@ class Supervisor:
             warnings=result.warnings,
         )
         await self._notify_event(worker_id)
-        for warning in result.warnings:
+        for warning in new_result_warnings:
             await self._append_event(
                 worker_id,
                 "worker.warning",
@@ -1086,18 +1158,8 @@ def _copy_display(display: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
     }
 
 
-def _result_json(result: AuditResult) -> dict[str, JsonValue]:
-    findings: list[JsonValue] = [
-        {
-            "severity": finding.severity,
-            "evidence": finding.evidence,
-            "affected_requirement_or_location": (
-                finding.affected_requirement_or_location
-            ),
-        }
-        for finding in result.findings
-    ]
-    return {
+def _result_json(result: WorkerResult) -> dict[str, JsonValue]:
+    serialized: dict[str, JsonValue] = {
         "outcome": result.outcome,
         "summary": result.summary,
         "files": list(result.files),
@@ -1105,20 +1167,37 @@ def _result_json(result: AuditResult) -> dict[str, JsonValue]:
         "risks": list(result.risks),
         "requested_model": result.requested_model,
         "resolved_model": result.resolved_model,
-        "verdict": result.verdict,
-        "confirmed": list(result.confirmed),
-        "findings": findings,
-        "required_changes": list(result.required_changes),
         "actual_models": list(result.actual_models),
         "session_id": result.session_id,
         "nested_state": result.nested_state,
         "warnings": list(result.warnings),
         "errors": list(result.errors),
     }
+    if isinstance(result, AuditResult):
+        findings: list[JsonValue] = [
+            {
+                "severity": finding.severity,
+                "evidence": finding.evidence,
+                "affected_requirement_or_location": (
+                    finding.affected_requirement_or_location
+                ),
+            }
+            for finding in result.findings
+        ]
+        serialized.update(
+            {
+                "verdict": result.verdict,
+                "confirmed": list(result.confirmed),
+                "findings": findings,
+                "required_changes": list(result.required_changes),
+            }
+        )
+    return serialized
 
 
-def _execution_failure(contract: AuditContract) -> AuditResult:
-    return AuditResult(
+def _execution_failure(contract: WorkerContract) -> WorkerResult:
+    result_type = CoderResult if isinstance(contract, CoderContract) else AuditResult
+    return result_type(
         outcome="failed",
         summary="Worker execution failed.",
         files=(),

@@ -337,7 +337,14 @@ _EVENT_SCHEMAS: dict[str, _EventSchema] = {
         required={"outcome": _one_of("completed", "partial", "blocked", "failed")},
         optional={"model": _MODEL},
     ),
-    "worker.warning": _EventSchema(required={"code": _CODE}, optional={}),
+    "worker.warning": _EventSchema(
+        required={"code": _CODE},
+        optional={
+            "worker_id": _IDENTIFIER,
+            "cwd": _PATH,
+            "relation": _one_of("same", "ancestor", "descendant"),
+        },
+    ),
     "runtime.exited": _EventSchema(
         required={}, optional={"exit_code": _non_negative_integer}
     ),
@@ -985,6 +992,23 @@ class WorkerStore:
                 "UPDATE workers SET health = ? WHERE worker_id = ?",
                 (health, event.worker_id),
             )
+        elif event.type == "worker.warning":
+            code = event.payload.get("code")
+            if not isinstance(code, str):
+                raise ValueError("worker.warning requires a string code.")
+            row = connection.execute(
+                "SELECT warnings FROM workers WHERE worker_id = ?",
+                (event.worker_id,),
+            ).fetchone()
+            if row is None:
+                raise AssertionError("Event worker disappeared during its transaction.")
+            warnings = cast(list[str], json.loads(cast(str, row["warnings"])))
+            if code not in warnings:
+                warnings.append(code)
+                connection.execute(
+                    "UPDATE workers SET warnings = ? WHERE worker_id = ?",
+                    (json.dumps(warnings, separators=(",", ":")), event.worker_id),
+                )
 
 
 def _worker_from_row(row: sqlite3.Row) -> WorkerRecord:
