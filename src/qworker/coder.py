@@ -187,6 +187,7 @@ class _CoderResultReducer:
         self._resolved_model = resolved_model
         self._active_task_ids: set[str] = set()
         self._actual_models: list[str] = []
+        self._assistant_text: list[str] = []
         self._result: ResultEvent | None = None
 
     @property
@@ -196,6 +197,7 @@ class _CoderResultReducer:
     def apply(self, event: AdapterEvent) -> None:
         if isinstance(event, AssistantEvent):
             self._record_model(event.model)
+            self._assistant_text.extend(event.text)
         elif isinstance(event, TaskStartedEvent):
             self._active_task_ids.add(event.task_id)
         elif isinstance(event, TaskTerminalEvent):
@@ -222,6 +224,15 @@ class _CoderResultReducer:
             )
 
         report = _parse_report(event.result)
+        if report is None:
+            report = next(
+                (
+                    parsed
+                    for text in reversed(self._assistant_text)
+                    if (parsed := _parse_report(text)) is not None
+                ),
+                None,
+            )
         warnings: list[str] = []
         if report is None:
             outcome: CoderOutcome = "failed" if event.is_error else "partial"

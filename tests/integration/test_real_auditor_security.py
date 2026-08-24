@@ -19,7 +19,7 @@ from qoder_agent_sdk import (
 )
 from qoder_agent_sdk.types import ToolPermissionContext
 
-from qworker.events import AdapterEvent, ResultEvent
+from qworker.events import AdapterEvent, AssistantEvent, ResultEvent
 from qworker.model_policy import AvailableModel
 from qworker.preflight import RuntimePreflight
 from qworker.qoder_sdk import (
@@ -37,6 +37,18 @@ from tests.fakes import FakeQoderTransport
 from tests.real_qoder import require_real_qoder_credentials
 
 _CLI_BOOTSTRAP = "from qworker.cli import main; raise SystemExit(main())"
+
+
+def _valid_coder_report() -> str:
+    return json.dumps(
+        {
+            "outcome": "completed",
+            "summary": "synthetic edit completed",
+            "files": ["marker.txt"],
+            "validation": ["marker bytes verified"],
+            "risks": [],
+        }
+    )
 
 
 class _EditingCoderTransport(FakeQoderTransport):
@@ -74,6 +86,35 @@ class _EditingCoderTransport(FakeQoderTransport):
     async def messages(self) -> AsyncIterator[AdapterEvent]:
         async for event in super().messages():
             yield event
+
+
+class _IncompleteCoderReportTransport(FakeQoderTransport):
+    """Apply one edit, then emit the smallest non-contract coder result."""
+
+    def __init__(self, workspace: Path) -> None:
+        super().__init__(
+            models=(AvailableModel(value="Qwen3.8-Max", enabled=True),),
+            events=(
+                AssistantEvent(
+                    text=(_valid_coder_report(),),
+                    tools=(),
+                    model="Qwen3.8-Max",
+                ),
+                ResultEvent(
+                    session_id="synthetic-ac5-session",
+                    is_error=False,
+                    result="{}",
+                    model_usage=("Qwen3.8-Max",),
+                ),
+            ),
+        )
+        self._workspace = workspace
+
+    async def send(self, prompt: str) -> None:
+        await super().send(prompt)
+        (self._workspace / "marker.txt").write_text(
+            "synthetic-marker\n", encoding="utf-8"
+        )
 
 
 async def _run_cli(
@@ -363,6 +404,44 @@ def test_coder_evidence_reduces_result_and_workspace_to_fixed_booleans(
     }
 
     assert all(_safe_coder_evidence(result, tmp_path, marker).values())
+
+
+async def test_ac5_replay_requires_contract_after_successful_coder_edit(
+    tmp_path: Path,
+) -> None:
+    """Replay the live AC5 edit/result split without credentials or network."""
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    transport = _IncompleteCoderReportTransport(workspace)
+    supervisor = Supervisor(
+        WorkerStore(tmp_path / "state"),
+        lambda _cwd: FakeQoderTransport.successful_audit(model="Qwen3.8-Max"),
+        coder_transport_factory=lambda _cwd: transport,
+        sdk_version="1.0.13",
+    )
+    socket_path = tmp_path / "runtime" / "qworker.sock"
+    server = RPCServer(supervisor, socket_path)
+    await server.start()
+    try:
+        accepted = await _one_cli_frame(
+            socket_path,
+            ("spawn", "--role", "coder", "--cwd", str(workspace), "--json"),
+            stdin="write the synthetic marker",
+        )
+        worker_id = str(accepted["worker_id"])
+        await _run_cli(
+            socket_path,
+            ("watch", worker_id, "--since", "0", "--follow", "--json"),
+        )
+        result = await _one_cli_frame(socket_path, ("result", worker_id, "--json"))
+
+        evidence = _safe_coder_evidence(result, workspace, "synthetic-marker")
+        if not all(evidence.values()):
+            _fail_with_safe_evidence("AC5 deterministic replay:", evidence)
+    finally:
+        await server.close()
+        await supervisor.close()
 
 
 async def test_public_coder_edits_disposable_workspace_without_leaking_credentials(
