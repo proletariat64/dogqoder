@@ -2,13 +2,18 @@
 
 import os
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 
 import pytest
 
+from qworker.auditor import ForegroundAuditor
 from qworker.domain import AuditContract, AuditResult
+from qworker.qoder_sdk import create_resumed_transport
+from qworker.transport import QoderTransport
 
 type AuditRunner = Callable[[AuditContract], Awaitable[AuditResult]]
 type AuditRunnerFactory = Callable[[], AuditRunner]
+type ResumeTransportFactory = Callable[[Path, str], QoderTransport]
 
 
 def require_real_qoder_credentials() -> None:
@@ -26,3 +31,17 @@ async def run_credential_gated_audit(
 
     require_real_qoder_credentials()
     return await runner_factory()(contract)
+
+
+async def run_resumed_adapter_audit(
+    contract: AuditContract,
+    session_id: str,
+    *,
+    resume_transport_factory: ResumeTransportFactory = create_resumed_transport,
+) -> AuditResult:
+    """Run one fresh adapter-backed process with stored conversation history."""
+
+    def transport_factory(cwd: Path) -> QoderTransport:
+        return resume_transport_factory(cwd, session_id)
+
+    return await ForegroundAuditor(transport_factory).run(contract)

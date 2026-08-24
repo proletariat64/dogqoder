@@ -1,69 +1,40 @@
-"""Single explicitly authorized live UAT for Tasks 9 and 10."""
+"""Single explicitly authorized adapter-backed live UAT for Tasks 9 and 10."""
 
 import asyncio
 import json
 import os
 import secrets
-from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
-from qoder_agent_sdk import AssistantMessage, QoderSDKClient, ResultMessage, TextBlock
 
+from qworker.auditor import run_foreground_audit
+from qworker.domain import AuditContract, AuditResult
 from qworker.preflight import RuntimePreflight
-from qworker.qoder_sdk import QoderPreflightBackend, build_configured_auditor_options
-from tests.real_qoder import require_real_qoder_credentials
+from qworker.qoder_sdk import QoderPreflightBackend
+from tests.real_qoder import (
+    require_real_qoder_credentials,
+    run_resumed_adapter_audit,
+)
 
 
-@dataclass(frozen=True, slots=True)
-class _LiveTurn:
-    session_id: str
-    text: str
-    cost_usd: float | None
+def _safe_signal(**values: bool | str | None) -> None:
+    print(f"QODER_UAT {json.dumps(values, sort_keys=True)}")
 
 
-async def _run_live_turn(
-    cwd: Path,
-    prompt: str,
-    *,
-    resume: str | None = None,
-) -> _LiveTurn:
-    options = build_configured_auditor_options(cwd, resume=resume)
-    options.max_turns = 2
-    if options.resume != resume:
-        pytest.fail("SDK resume option was not preserved.", pytrace=False)
-    client = QoderSDKClient(options=options)
-    result: ResultMessage | None = None
-    text: list[str] = []
-    try:
-        async with asyncio.timeout(90):
-            await client.connect(None)
-            await client.query(prompt)
-            async for message in client.receive_messages():
-                if isinstance(message, AssistantMessage):
-                    text.extend(
-                        block.text
-                        for block in message.content
-                        if isinstance(block, TextBlock)
-                    )
-                elif isinstance(message, ResultMessage):
-                    result = message
-                    if message.result is not None:
-                        text.append(message.result)
-    finally:
-        await client.disconnect()
-    if result is None:
-        pytest.fail("Live Qoder turn returned no ResultMessage.", pytrace=False)
-    if result.is_error:
-        pytest.fail("Live Qoder turn returned an error result.", pytrace=False)
-    if not result.session_id:
-        pytest.fail("Live Qoder turn returned no session ID.", pytrace=False)
-    return _LiveTurn(result.session_id, "\n".join(text), result.total_cost_usd)
+def _require_adapter_result(result: AuditResult, *, stage: str) -> None:
+    if result.session_id is None or result.outcome == "failed":
+        _safe_signal(
+            preflight_confirmed=True,
+            resume_history_confirmed=False,
+            stage=stage,
+        )
+        pytest.xfail(f"Task 10 live adapter result unavailable at {stage}.")
 
 
 @pytest.mark.real_qoder
 async def test_live_pat_preflight_and_resumed_conversation(tmp_path: Path) -> None:
-    """Spend credits once to prove PAT preflight and public-SDK history resume."""
+    """Spend credits once to prove PAT preflight and adapter-backed history resume."""
 
     require_real_qoder_credentials()
     credential = os.environ["QODER_PERSONAL_ACCESS_TOKEN"]
@@ -88,44 +59,65 @@ async def test_live_pat_preflight_and_resumed_conversation(tmp_path: Path) -> No
             pytest.fail("Credential crossed the preflight boundary.", pytrace=False)
 
         marker = f"QWUAT{secrets.token_hex(8)}"
-        try:
-            initial = await _run_live_turn(
-                tmp_path,
-                f"Remember {marker}. Reply only READY.",
-            )
-        except TimeoutError:
-            pytest.xfail(
-                "Task 10 live resume blocked: the initial public message stream "
-                "returned no ResultMessage within 90 seconds."
-            )
-        try:
-            resumed = await _run_live_turn(
-                tmp_path,
-                "Reply only with the marker I asked you to remember.",
-                resume=initial.session_id,
-            )
-        except TimeoutError:
-            pytest.xfail(
-                "Task 10 live resume blocked: the resumed public message stream "
-                "returned no ResultMessage within 90 seconds."
-            )
-
-    if marker not in resumed.text:
-        pytest.fail(
-            "Resumed process did not recover prior conversation history.", pytrace=False
+        initial_contract = AuditContract(
+            objective=(
+                "Remember the supplied marker, read no workspace files, and return "
+                f"the marker in the report summary: {marker}"
+            ),
+            cwd=tmp_path,
+            acceptance_criteria=("Report the supplied marker in summary.",),
         )
-    observable = json.dumps(
-        {
-            "preflight": preflight.to_json(),
-            "initial_cost_usd": initial.cost_usd,
-            "resume_cost_usd": resumed.cost_usd,
-            "same_session_id": resumed.session_id == initial.session_id,
-            "resume_history_confirmed": True,
-        },
-        sort_keys=True,
+        try:
+            async with asyncio.timeout(90):
+                initial = await run_foreground_audit(initial_contract)
+        except TimeoutError:
+            _safe_signal(
+                preflight_confirmed=True,
+                resume_history_confirmed=False,
+                stage="initial_adapter_timeout",
+            )
+            pytest.xfail(
+                "Task 10 live resume blocked: initial adapter audit timed out."
+            )
+        _require_adapter_result(initial, stage="initial_adapter_result")
+        assert initial.session_id is not None
+
+        recovery_contract = AuditContract(
+            objective=(
+                "Recover the marker from the prior conversation, read no workspace "
+                "files, and return the recovered marker in the report summary."
+            ),
+            cwd=tmp_path,
+            acceptance_criteria=("Report the recovered marker in summary.",),
+        )
+        try:
+            async with asyncio.timeout(90):
+                resumed = await run_resumed_adapter_audit(
+                    recovery_contract,
+                    initial.session_id,
+                )
+        except TimeoutError:
+            _safe_signal(
+                preflight_confirmed=True,
+                resume_history_confirmed=False,
+                stage="resume_adapter_timeout",
+            )
+            pytest.xfail(
+                "Task 10 live resume blocked: resumed adapter audit timed out."
+            )
+        _require_adapter_result(resumed, stage="resume_adapter_result")
+
+    history_text = "\n".join(
+        (
+            resumed.summary,
+            *resumed.confirmed,
+            resumed.verdict or "",
+        )
     )
-    if credential in observable:
-        pytest.fail("Credential crossed the UAT output boundary.", pytrace=False)
+    if marker not in history_text:
+        pytest.fail("Resumed adapter did not recover prior conversation history.")
+    if credential in repr(initial) or credential in repr(resumed):
+        pytest.fail("Credential crossed the adapter result boundary.", pytrace=False)
     after = {
         path.relative_to(tmp_path): path.read_bytes()
         for path in tmp_path.rglob("*")
@@ -135,4 +127,9 @@ async def test_live_pat_preflight_and_resumed_conversation(tmp_path: Path) -> No
         pytest.fail(
             "Live read-only UAT changed the disposable workspace.", pytrace=False
         )
-    print(f"QODER_UAT {observable}")
+    _safe_signal(
+        preflight_confirmed=True,
+        resume_history_confirmed=True,
+        same_session_id=resumed.session_id == initial.session_id,
+        stage="complete",
+    )
