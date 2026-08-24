@@ -314,6 +314,94 @@ async def test_grace_timeout_bounds_a_stuck_interrupt(tmp_path: Path) -> None:
     await supervisor.close()
 
 
+@pytest.mark.parametrize("operation", ("normal", "force", "close"))
+async def test_stop_and_close_bound_a_nonreturning_disconnect(
+    tmp_path: Path,
+    operation: Literal["normal", "force", "close"],
+) -> None:
+    class NonReturningDisconnectTransport(StoppableFakeQoderTransport):
+        def __init__(self, order: list[str]) -> None:
+            super().__init__(order)
+            self.child_live = True
+            self.aborted = False
+            self.disconnect_started = asyncio.Event()
+            self.allow_disconnect = asyncio.Event()
+
+        async def disconnect(self) -> None:
+            self._order.append("disconnect")
+            self.disconnect_started.set()
+            try:
+                await self.allow_disconnect.wait()
+            except asyncio.CancelledError:
+                self.child_live = False
+                self.disconnected = True
+                raise
+            self.child_live = False
+            self.disconnected = True
+
+        def abort(self) -> None:
+            self.aborted = True
+            self.child_live = False
+            self.disconnected = True
+
+    order: list[str] = []
+    transport = NonReturningDisconnectTransport(order)
+    store = WorkerStore(tmp_path / "state")
+    supervisor = Supervisor(
+        store,
+        lambda _cwd: transport,
+        sdk_version="1.0.13",
+        stop_timeout=0.01,
+    )
+    worker_id = await _spawn_running(supervisor, tmp_path)
+    assert transport.callbacks is not None
+    approval = asyncio.create_task(
+        transport.callbacks.request_permission(
+            PermissionRequest(
+                tool_name="Read",
+                agent_id=None,
+                display_message="Read while testing bounded teardown?",
+            )
+        )
+    )
+    for _ in range(100):
+        if (await supervisor.status(worker_id))["state"] == "requires_action":
+            break
+        await asyncio.sleep(0)
+
+    try:
+        if operation == "close":
+            await asyncio.wait_for(supervisor.close(), timeout=0.1)
+        else:
+            await asyncio.wait_for(
+                supervisor.stop(worker_id, force=operation == "force"),
+                timeout=0.1,
+            )
+    finally:
+        transport.allow_disconnect.set()
+        await asyncio.wait_for(supervisor.close(), timeout=0.5)
+
+    status = await supervisor.status(worker_id)
+    resolved = [
+        event
+        for event in await store.events_since(worker_id)
+        if event.type == "approval.resolved"
+    ]
+    assert status["state"] == "cancelled"
+    assert status["health"] == "exited"
+    assert await supervisor.result(worker_id) is None
+    assert (await approval).action == "deny"
+    assert [event.payload["status"] for event in resolved] == ["expired"]
+    assert transport.child_live is False
+    assert transport.aborted is True
+    assert transport.disconnect_started.is_set()
+    assert not [
+        task
+        for task in asyncio.all_tasks()
+        if task.get_name().startswith("qworker:")
+    ]
+
+
 async def test_unexpected_eof_before_result_is_lost_without_retry(
     tmp_path: Path,
 ) -> None:
@@ -644,6 +732,136 @@ async def test_stop_joins_accepted_result_persistence(
     await supervisor.close()
 
 
+async def _exercise_overlapping_result_stop(
+    tmp_path: Path,
+    *,
+    is_error: bool,
+    close_second: bool,
+) -> None:
+    class OverlappingStopTransport(FakeQoderTransport):
+        def __init__(self) -> None:
+            super().__init__(
+                models=(AvailableModel(value="Qwen3.8-Max", enabled=True),),
+                events=(),
+            )
+            self.result_seen = asyncio.Event()
+            self.interrupt_started = asyncio.Event()
+            self.allow_interrupt = asyncio.Event()
+            self.allow_force_disconnect = asyncio.Event()
+            self._stream_ended = asyncio.Event()
+
+        async def messages(self) -> AsyncIterator[AdapterEvent]:
+            yield TaskStartedEvent(
+                task_id="nested-before-overlapping-stop",
+                description="settlement still pending",
+            )
+            yield ResultEvent(
+                session_id="session-before-overlapping-stop",
+                is_error=is_error,
+                result=SUCCESSFUL_AUDIT_REPORT,
+                errors=("model_error",) if is_error else (),
+            )
+            self.result_seen.set()
+            await self._stream_ended.wait()
+            raise EOFError("overlapping stop ended settlement")
+
+        async def interrupt(self) -> None:
+            self.interrupt_started.set()
+            await self.allow_interrupt.wait()
+            self._stream_ended.set()
+            for _ in range(10):
+                await asyncio.sleep(0)
+            raise EOFError("interrupt observed process exit")
+
+        async def disconnect(self) -> None:
+            if not self._stream_ended.is_set():
+                await self.allow_force_disconnect.wait()
+            self.disconnected = True
+
+    store = PausedResultStore(tmp_path / "state")
+    transport = OverlappingStopTransport()
+    supervisor = Supervisor(
+        store,
+        lambda _cwd: transport,
+        sdk_version="1.0.13",
+        stop_timeout=0.1,
+    )
+    worker_id = await _spawn_running(supervisor, tmp_path)
+    await asyncio.wait_for(transport.result_seen.wait(), timeout=0.2)
+
+    normal_stop = asyncio.create_task(supervisor.stop(worker_id))
+    await asyncio.wait_for(transport.interrupt_started.wait(), timeout=0.2)
+    second_call = asyncio.create_task(
+        supervisor.close() if close_second else supervisor.stop(worker_id, force=True)
+    )
+    for _ in range(10):
+        await asyncio.sleep(0)
+    transport.allow_interrupt.set()
+    await asyncio.wait_for(store.record_started.wait(), timeout=0.2)
+    for _ in range(10):
+        await asyncio.sleep(0)
+    transport.allow_force_disconnect.set()
+    for _ in range(10):
+        await asyncio.sleep(0)
+    store.allow_record.set()
+    await asyncio.wait_for(
+        asyncio.gather(normal_stop, second_call),
+        timeout=0.5,
+    )
+
+    expected_state = "failed" if is_error else "completed"
+    status = await supervisor.status(worker_id)
+    result = await supervisor.result(worker_id)
+    events = [event async for event in supervisor.watch(worker_id, since=0)]
+    terminal_states: list[JsonValue] = []
+    for event in events:
+        payload = event["payload"]
+        if event["type"] == "worker.state_changed" and isinstance(payload, dict):
+            state = payload.get("state")
+            if state in _TERMINAL_STATE_NAMES:
+                terminal_states.append(state)
+    assert status["state"] == expected_state
+    assert result is not None
+    assert result["outcome"] == expected_state
+    assert result["session_id"] == "session-before-overlapping-stop"
+    assert terminal_states == [expected_state]
+    assert [event["type"] for event in events].count("result.received") == 1
+    assert not [
+        task
+        for task in asyncio.all_tasks()
+        if task.get_name().startswith("qworker-result:")
+    ]
+    if not close_second:
+        await supervisor.close()
+
+
+_TERMINAL_STATE_NAMES = frozenset(("completed", "failed", "cancelled", "lost"))
+
+
+@pytest.mark.parametrize("is_error", (False, True))
+async def test_concurrent_normal_and_force_stop_join_one_result_phase(
+    tmp_path: Path,
+    is_error: bool,
+) -> None:
+    await _exercise_overlapping_result_stop(
+        tmp_path,
+        is_error=is_error,
+        close_second=False,
+    )
+
+
+@pytest.mark.parametrize("is_error", (False, True))
+async def test_stop_and_close_join_one_result_phase(
+    tmp_path: Path,
+    is_error: bool,
+) -> None:
+    await _exercise_overlapping_result_stop(
+        tmp_path,
+        is_error=is_error,
+        close_second=True,
+    )
+
+
 async def test_cli_and_rpc_stop_and_reject_selected_nested_agent(
     tmp_path: Path,
 ) -> None:
@@ -726,6 +944,36 @@ async def test_sdk_process_error_becomes_eof_without_exposing_stderr() -> None:
         await anext(transport.messages())
 
     assert "must-not-cross-adapter" not in str(captured.value)
+
+
+def test_sdk_abort_kills_a_live_cli_process_without_waiting() -> None:
+    class LiveProcess:
+        returncode: int | None = None
+
+        def __init__(self) -> None:
+            self.killed = False
+
+        def kill(self) -> None:
+            self.killed = True
+
+    class RuntimeTransport:
+        def __init__(self, process: LiveProcess) -> None:
+            self._process = process
+
+    class Query:
+        def __init__(self, process: LiveProcess) -> None:
+            self.transport = RuntimeTransport(process)
+
+    class Client:
+        def __init__(self, process: LiveProcess) -> None:
+            self._query = Query(process)
+
+    process = LiveProcess()
+    transport = QoderSDKTransport(Client(process))
+
+    transport.abort()
+
+    assert process.killed is True
 
 
 def test_starting_worker_can_be_cancelled_but_not_completed() -> None:

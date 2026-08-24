@@ -93,3 +93,7 @@ class FakeQoderTransport:
     async def disconnect(self) -> None:
         self.disconnected = True
         self.calls.append("disconnect")
+
+    def abort(self) -> None:
+        self.disconnected = True
+        self.calls.append("abort")

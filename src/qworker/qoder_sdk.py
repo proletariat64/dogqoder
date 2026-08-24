@@ -422,6 +422,22 @@ class QoderSDKTransport:
             )
             self._disconnected = True
 
+    def abort(self) -> None:
+        """Best-effort synchronous kill when SDK teardown cannot meet its deadline."""
+
+        self._disconnected = True
+        query = getattr(self._client, "_query", None)
+        transport = getattr(query, "transport", None)
+        process = getattr(transport, "_process", None)
+        if process is None or getattr(process, "returncode", None) is not None:
+            return
+        kill = getattr(process, "kill", None)
+        if callable(kill):
+            try:
+                kill()
+            except ProcessLookupError:
+                pass
+
 
 async def _call_sdk[ResultT](
     call: Callable[[], Awaitable[ResultT]],
