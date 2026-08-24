@@ -328,13 +328,20 @@ class QoderSDKTransport:
             request: SDKElicitationRequest,
         ) -> SDKElicitationResult:
             mode = request.get("mode", "form")
-            safe_mode = mode if mode in ("form", "url") else "form"
+            if mode not in ("form", "url"):
+                return {"action": "cancel"}
+            requested_schema = request.get("requestedSchema")
             try:
                 decision = await callbacks.request_elicitation(
                     ElicitationRequest(
                         server_name=request["serverName"],
-                        mode=safe_mode,
+                        mode=mode,
                         display_message=request["message"],
+                        requested_schema=(
+                            requested_schema
+                            if isinstance(requested_schema, dict)
+                            else None
+                        ),
                     )
                 )
             except Exception:  # noqa: BLE001 -- callback failures cancel elicitation

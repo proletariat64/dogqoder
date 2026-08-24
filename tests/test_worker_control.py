@@ -2,7 +2,7 @@ import asyncio
 import json
 import sqlite3
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from io import StringIO
 from pathlib import Path
 from typing import cast
@@ -29,7 +29,7 @@ from qworker.events import AdapterEvent, ResultEvent
 from qworker.model_policy import AvailableModel
 from qworker.qoder_sdk import QoderSDKTransport, build_auditor_options
 from qworker.rpc import RPCServer
-from qworker.store import WorkerStore
+from qworker.store import EventRecord, JsonValue, WorkerStore
 from qworker.supervisor import Supervisor, SupervisorError
 from tests.fakes import SUCCESSFUL_AUDIT_REPORT, FakeQoderTransport
 
@@ -76,21 +76,140 @@ class ControlledFakeQoderTransport(FakeQoderTransport):
             yield event
 
 
+class PausingApprovalStore(WorkerStore):
+    """Pause one approval append before its real SQLite transaction."""
+
+    def __init__(self, state_dir: Path) -> None:
+        super().__init__(state_dir)
+        self.approval_append_started = asyncio.Event()
+        self.release_approval_append = asyncio.Event()
+
+    async def append_event(
+        self,
+        worker_id: str,
+        event_type: str,
+        payload: Mapping[str, JsonValue],
+    ) -> EventRecord:
+        if event_type == "approval.requested":
+            self.approval_append_started.set()
+            await self.release_approval_append.wait()
+        return await super().append_event(worker_id, event_type, payload)
+
+    async def record_approval_request(
+        self,
+        worker_id: str,
+        *,
+        expected_attempt: int,
+        payload: Mapping[str, JsonValue],
+    ) -> tuple[EventRecord, ...]:
+        self.approval_append_started.set()
+        await self.release_approval_append.wait()
+        return await super().record_approval_request(
+            worker_id,
+            expected_attempt=expected_attempt,
+            payload=payload,
+        )
+
+
 async def _spawn_running(
     tmp_path: Path,
+    *,
+    store: WorkerStore | None = None,
 ) -> tuple[Supervisor, ControlledFakeQoderTransport, str, WorkerStore]:
     transport = ControlledFakeQoderTransport()
-    store = WorkerStore(tmp_path / "state")
-    supervisor = Supervisor(store, lambda _cwd: transport, sdk_version="1.0.13")
+    worker_store = store or WorkerStore(tmp_path / "state")
+    supervisor = Supervisor(
+        worker_store, lambda _cwd: transport, sdk_version="1.0.13"
+    )
     accepted = await supervisor.spawn(
         AuditContract(objective="audit live controls", cwd=tmp_path)
     )
     worker_id = str(accepted["worker_id"])
     for _ in range(20):
         if (await supervisor.status(worker_id))["state"] == "running":
-            return supervisor, transport, worker_id, store
+            return supervisor, transport, worker_id, worker_store
         await asyncio.sleep(0)
     raise AssertionError("worker did not initialize")
+
+
+async def _request_permission(
+    transport: ControlledFakeQoderTransport,
+) -> asyncio.Task[PermissionDecision]:
+    callbacks = transport.callbacks
+    assert callbacks is not None
+    return asyncio.create_task(
+        callbacks.request_permission(
+            PermissionRequest(tool_name="Read", agent_id=None, display_message="safe")
+        )
+    )
+
+
+async def test_completion_during_approval_creation_leaves_no_orphan(
+    tmp_path: Path,
+) -> None:
+    store = PausingApprovalStore(tmp_path / "state")
+    supervisor, transport, worker_id, _store = await _spawn_running(
+        tmp_path, store=store
+    )
+    permission = await _request_permission(transport)
+    await store.approval_append_started.wait()
+
+    transport.finish.set()
+    for _ in range(20):
+        if transport.disconnected:
+            break
+        await asyncio.sleep(0)
+    store.release_approval_append.set()
+
+    assert (await permission).action == "deny"
+    for _ in range(20):
+        if (await supervisor.status(worker_id))["state"] == "completed":
+            break
+        await asyncio.sleep(0)
+    assert (await supervisor.status(worker_id))["state"] == "completed"
+    approval_events = [
+        event
+        for event in await store.events_since(worker_id)
+        if event.type.startswith("approval.")
+    ]
+    assert approval_events == [] or [
+        (event.type, event.payload.get("status")) for event in approval_events
+    ] == [
+        ("approval.requested", None),
+        ("approval.resolved", "expired"),
+    ]
+    assert (await supervisor.status(worker_id))["pending_approvals"] == []
+    await supervisor.close()
+
+
+@pytest.mark.parametrize("resume", (False, True), ids=("loss", "loss-resume"))
+async def test_loss_or_resume_during_approval_creation_persists_no_request(
+    tmp_path: Path,
+    resume: bool,
+) -> None:
+    store = PausingApprovalStore(tmp_path / "state")
+    supervisor, transport, worker_id, _store = await _spawn_running(
+        tmp_path, store=store
+    )
+    permission = await _request_permission(transport)
+    await store.approval_append_started.wait()
+    await store.append_event(
+        worker_id,
+        "worker.state_changed",
+        {"schema_version": 1, "state": "lost"},
+    )
+    if resume:
+        assert (await store.start_attempt(worker_id)).attempt == 2
+
+    store.release_approval_append.set()
+
+    assert (await permission).action == "deny"
+    assert not any(
+        event.type.startswith("approval.")
+        for event in await store.events_since(worker_id)
+    )
+    assert (await supervisor.status(worker_id))["pending_approvals"] == []
+    await supervisor.close()
 
 
 @pytest.mark.parametrize("cancelled", (True, False))
@@ -258,6 +377,253 @@ async def test_permission_and_elicitation_callbacks_pause_and_resume_worker(
     await supervisor.close()
 
 
+async def test_pending_status_and_events_expose_only_safe_approval_display(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment_secret = "opaque-environment-display-secret"
+    keyed_secret = "opaque-keyed-display-secret"
+    monkeypatch.setenv("QODER_PERSONAL_ACCESS_TOKEN", environment_secret)
+    supervisor, transport, worker_id, store = await _spawn_running(tmp_path)
+    callbacks = transport.callbacks
+    assert callbacks is not None
+
+    permission = asyncio.create_task(
+        callbacks.request_permission(
+            PermissionRequest(
+                tool_name="Read",
+                agent_id="nested-safe",
+                display_message=f"raw {environment_secret} password={keyed_secret}",
+            )
+        )
+    )
+    for _ in range(20):
+        status = await supervisor.status(worker_id)
+        if status["state"] == "requires_action":
+            break
+        await asyncio.sleep(0)
+    pending = status["pending_approvals"]
+    assert isinstance(pending, list)
+    assert len(pending) == 1
+    permission_display = pending[0]
+    assert isinstance(permission_display, dict)
+    permission_request_id = permission_display["request_id"]
+    assert permission_display == {
+        "request_id": permission_request_id,
+        "attempt": 1,
+        "kind": "tool_permission",
+        "agent_id": "nested-safe",
+        "tool_name": "Read",
+        "prompt": "Allow tool Read for this turn?",
+        "choices": ["allow", "deny"],
+    }
+    requested = [
+        event
+        for event in await store.events_since(worker_id)
+        if event.type == "approval.requested"
+    ][-1]
+    assert requested.payload == {
+        "schema_version": 1,
+        **{
+            key: value
+            for key, value in permission_display.items()
+            if key != "attempt"
+        },
+    }
+    assert isinstance(permission_request_id, str)
+    await supervisor.respond(
+        worker_id,
+        permission_request_id,
+        {"action": "deny"},
+    )
+    assert (await permission).action == "deny"
+
+    elicitation = asyncio.create_task(
+        callbacks.request_elicitation(
+            ElicitationRequest(
+                server_name="safe-server",
+                mode="form",
+                display_message=(
+                    f"Choose region; token={keyed_secret}; {environment_secret}; "
+                    + "x" * 600
+                ),
+                requested_schema={
+                    "type": "object",
+                    "properties": {
+                        "region": {"type": "string"},
+                        "count": {"type": "integer"},
+                    },
+                    "required": ["region"],
+                    "additionalProperties": False,
+                },
+            )
+        )
+    )
+    for _ in range(20):
+        status = await supervisor.status(worker_id)
+        if status["state"] == "requires_action":
+            break
+        await asyncio.sleep(0)
+    pending = status["pending_approvals"]
+    assert isinstance(pending, list)
+    assert len(pending) == 1
+    elicitation_display = pending[0]
+    assert isinstance(elicitation_display, dict)
+    elicitation_request_id = elicitation_display["request_id"]
+    assert elicitation_display["kind"] == "elicitation"
+    assert elicitation_display["server_name"] == "safe-server"
+    assert elicitation_display["mode"] == "form"
+    assert elicitation_display["choices"] == ["accept", "decline", "cancel"]
+    assert elicitation_display["fields"] == ["count:integer", "region:string"]
+    assert elicitation_display["required_fields"] == ["region"]
+    prompt = elicitation_display["prompt"]
+    assert isinstance(prompt, str)
+    assert 0 < len(prompt) <= 256
+    assert "[REDACTED]" in prompt
+    assert environment_secret not in prompt
+    assert keyed_secret not in prompt
+    elicitation_event = [
+        event
+        for event in await store.events_since(worker_id)
+        if event.type == "approval.requested"
+    ][-1]
+    assert elicitation_event.payload == {
+        "schema_version": 1,
+        **{
+            key: value
+            for key, value in elicitation_display.items()
+            if key != "attempt"
+        },
+    }
+
+    with sqlite3.connect(store.database_path) as connection:
+        durable = json.dumps(connection.execute("SELECT * FROM events").fetchall())
+    assert environment_secret not in durable
+    assert keyed_secret not in durable
+    assert "additionalProperties" not in durable
+
+    assert isinstance(elicitation_request_id, str)
+    await supervisor.respond(
+        worker_id,
+        elicitation_request_id,
+        {"action": "decline"},
+    )
+    assert (await elicitation).action == "decline"
+    transport.finish.set()
+    await supervisor.close()
+
+
+async def test_elicitation_response_must_match_live_schema_and_mode(
+    tmp_path: Path,
+) -> None:
+    supervisor, transport, worker_id, store = await _spawn_running(tmp_path)
+    callbacks = transport.callbacks
+    assert callbacks is not None
+    form = asyncio.create_task(
+        callbacks.request_elicitation(
+            ElicitationRequest(
+                server_name="safe-server",
+                mode="form",
+                display_message="Choose a region and retry count.",
+                requested_schema={
+                    "type": "object",
+                    "properties": {
+                        "region": {"type": "string", "minLength": 2},
+                        "count": {"type": "integer", "minimum": 1},
+                    },
+                    "required": ["region"],
+                    "additionalProperties": False,
+                },
+            )
+        )
+    )
+    for _ in range(20):
+        if (await supervisor.status(worker_id))["state"] == "requires_action":
+            break
+        await asyncio.sleep(0)
+    form_request_id = await _latest_request_id(store, worker_id)
+
+    invalid_responses: tuple[dict[str, JsonValue], ...] = (
+        {"action": "accept"},
+        {"action": "accept", "content": {"count": 2}},
+        {"action": "accept", "content": {"region": "cn", "count": "two"}},
+        {
+            "action": "accept",
+            "content": {"region": "cn", "count": 2, "secret": "not allowed"},
+        },
+    )
+    for response in invalid_responses:
+        with pytest.raises(SupervisorError) as invalid:
+            await supervisor.respond(worker_id, form_request_id, response)
+        assert invalid.value.code == "invalid_request"
+        assert form.done() is False
+        assert (await supervisor.status(worker_id))["state"] == "requires_action"
+
+    assert await supervisor.respond(
+        worker_id,
+        form_request_id,
+        {"action": "accept", "content": {"region": "cn", "count": 2}},
+    ) == {"request_id": form_request_id, "status": "answered"}
+    assert (await form).content == {"region": "cn", "count": 2}
+
+    url = asyncio.create_task(
+        callbacks.request_elicitation(
+            ElicitationRequest(
+                server_name="safe-server",
+                mode="url",
+                display_message="Authorize access in the browser.",
+            )
+        )
+    )
+    for _ in range(20):
+        url_status = await supervisor.status(worker_id)
+        if url_status["state"] == "requires_action":
+            break
+        await asyncio.sleep(0)
+    url_pending = url_status["pending_approvals"]
+    assert isinstance(url_pending, list)
+    assert len(url_pending) == 1
+    assert isinstance(url_pending[0], dict)
+    assert url_pending[0]["mode"] == "url"
+    assert url_pending[0]["choices"] == ["accept", "decline", "cancel"]
+    assert "fields" not in url_pending[0]
+    assert "required_fields" not in url_pending[0]
+    url_request_id = await _latest_request_id(store, worker_id)
+
+    with pytest.raises(SupervisorError) as invalid_url:
+        await supervisor.respond(
+            worker_id,
+            url_request_id,
+            {"action": "accept", "content": {}},
+        )
+    assert invalid_url.value.code == "invalid_request"
+    assert url.done() is False
+    assert await supervisor.respond(
+        worker_id,
+        url_request_id,
+        {"action": "accept"},
+    ) == {"request_id": url_request_id, "status": "answered"}
+    assert (await url) == ElicitationDecision("accept")
+
+    resolved = [
+        event
+        for event in await store.events_since(worker_id)
+        if event.type == "approval.resolved"
+    ]
+    assert [event.payload["status"] for event in resolved] == [
+        "answered",
+        "answered",
+    ]
+    with sqlite3.connect(store.database_path) as connection:
+        durable = json.dumps(connection.execute("SELECT * FROM events").fetchall())
+    assert "additionalProperties" not in durable
+    assert "minLength" not in durable
+    assert "minimum" not in durable
+
+    transport.finish.set()
+    await supervisor.close()
+
+
 async def test_response_and_callbacks_reject_a_lost_attempt(
     tmp_path: Path,
 ) -> None:
@@ -390,6 +756,8 @@ async def test_sdk_adapter_bridges_callbacks_without_weakening_auditor_policy(
     assert permission_requests[0].agent_id == "nested-safe"
     assert elicited == {"action": "accept", "content": {"answer": "live-only"}}
     assert elicitation_requests[0].display_message == "secret live prompt"
+    assert elicitation_requests[0].mode == "form"
+    assert elicitation_requests[0].requested_schema == {"type": "object"}
 
     message_id = str(uuid.uuid4())
     await transport.steer("live steering prompt", priority="now", message_id=message_id)

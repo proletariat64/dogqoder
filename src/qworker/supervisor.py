@@ -2,7 +2,7 @@
 
 import asyncio
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -18,12 +18,13 @@ from qworker.control import (
     PermissionDecision,
     PermissionRequest,
     SteeringPriority,
+    approval_display,
     new_request_id,
     parse_approval_response,
 )
 from qworker.domain import AuditContract, AuditResult
 from qworker.lifecycle import WorkerRecord
-from qworker.store import EventRecord, JsonValue, WorkerStore
+from qworker.store import AttemptChangedError, EventRecord, JsonValue, WorkerStore
 from qworker.transport import QoderTransport
 
 _TERMINAL_STATES = frozenset(("completed", "failed", "cancelled", "lost"))
@@ -106,9 +107,18 @@ class Supervisor:
     async def status(self, worker_id: str) -> dict[str, JsonValue]:
         """Return durable current worker state and latest persisted cursor."""
 
-        worker = await self._require_worker(worker_id)
-        cursor = await self._store.latest_event_cursor(worker_id)
-        return _worker_json(worker, event_cursor=cursor)
+        async with self._control_lock:
+            worker = await self._require_worker(worker_id)
+            cursor = await self._store.latest_event_cursor(worker_id)
+            status = _worker_json(worker, event_cursor=cursor)
+            status["pending_approvals"] = [
+                _copy_display(pending.display)
+                for pending in self._pending_approvals.values()
+                if pending.worker_id == worker_id
+                and pending.attempt == worker.attempt
+                and worker.state == "requires_action"
+            ]
+            return status
 
     async def result(self, worker_id: str) -> dict[str, JsonValue] | None:
         """Return a durable structured result, or ``None`` while none exists."""
@@ -218,31 +228,33 @@ class Supervisor:
                     "Approval belongs to an attempt that is no longer live.",
                 )
             try:
-                decision = parse_approval_response(pending.kind, response)
-            except ValueError as error:
+                decision = parse_approval_response(pending.request, response)
+            except (TypeError, ValueError) as error:
                 raise SupervisorError("invalid_request", str(error)) from None
             status = _approval_status(decision)
-            await self._append_event(
-                worker_id,
-                "approval.resolved",
-                {
-                    "schema_version": 1,
-                    "request_id": request_id,
-                    "status": status,
-                },
-            )
             other_pending = any(
                 item.request_id != request_id
                 and item.worker_id == worker_id
                 and item.attempt == pending.attempt
                 for item in self._pending_approvals.values()
             )
-            if not other_pending:
-                await self._append_event(
+            try:
+                await self._store.record_approval_resolution(
                     worker_id,
-                    "worker.state_changed",
-                    {"schema_version": 1, "state": "running"},
+                    expected_attempt=pending.attempt,
+                    payload={
+                        "schema_version": 1,
+                        "request_id": request_id,
+                        "status": status,
+                    },
+                    restore_running=not other_pending,
                 )
+            except AttemptChangedError:
+                raise SupervisorError(
+                    "worker_not_live",
+                    "Approval belongs to an attempt that is no longer live.",
+                ) from None
+            await self._notify_event(worker_id)
             self._pending_approvals.pop(request_id, None)
             if not pending.future.done():
                 pending.future.set_result(decision)
@@ -359,16 +371,14 @@ class Supervisor:
             on_initialized=on_initialized,
         )
         try:
-            try:
-                result = await auditor.run(contract)
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001 -- isolate an arbitrary transport failure
-                result = _execution_failure(contract)
-        finally:
-            current = self._live_attempts.get(worker_id)
-            if current is not None and current.attempt == attempt:
-                self._live_attempts.pop(worker_id, None)
+            result = await auditor.run(contract)
+        except asyncio.CancelledError:
+            await self._detach_live_attempt(worker_id, attempt)
+            raise
+        except Exception:  # noqa: BLE001 -- isolate an arbitrary transport failure
+            result = _execution_failure(contract)
+
+        await self._complete_live_attempt(worker_id, attempt)
 
         await self._store.record_result(
             worker_id,
@@ -460,37 +470,31 @@ class Supervisor:
                 else "elicitation"
             )
             request_id = new_request_id()
+            display = approval_display(request_id, attempt, request)
+            if display is None:
+                return default
             pending = PendingApproval(
                 request_id=request_id,
                 worker_id=worker_id,
                 attempt=attempt,
                 kind=kind,
+                request=request,
+                display=display,
                 future=asyncio.get_running_loop().create_future(),
             )
             self._pending_approvals[request_id] = pending
-            payload: dict[str, JsonValue] = {
-                "schema_version": 1,
-                "request_id": request_id,
-                "kind": kind,
-            }
-            if (
-                isinstance(request, PermissionRequest)
-                and request.agent_id is not None
-                and _safe_identifier(request.agent_id)
-            ):
-                payload["agent_id"] = request.agent_id
+            payload = {"schema_version": 1, **display}
+            payload.pop("attempt")
             try:
-                await self._append_event(
+                await self._store.record_approval_request(
                     worker_id,
-                    "approval.requested",
-                    payload,
+                    expected_attempt=attempt,
+                    payload=payload,
                 )
-                if worker.state == "running":
-                    await self._append_event(
-                        worker_id,
-                        "worker.state_changed",
-                        {"schema_version": 1, "state": "requires_action"},
-                    )
+                await self._notify_event(worker_id)
+            except AttemptChangedError:
+                self._pending_approvals.pop(request_id, None)
+                return default
             except BaseException:
                 self._pending_approvals.pop(request_id, None)
                 raise
@@ -501,6 +505,44 @@ class Supervisor:
                 async with self._control_lock:
                     if self._pending_approvals.get(request_id) is pending:
                         self._pending_approvals.pop(request_id, None)
+
+    async def _detach_live_attempt(self, worker_id: str, attempt: int) -> None:
+        async with self._control_lock:
+            current = self._live_attempts.get(worker_id)
+            if current is not None and current.attempt == attempt:
+                self._live_attempts.pop(worker_id, None)
+
+    async def _complete_live_attempt(self, worker_id: str, attempt: int) -> None:
+        async with self._control_lock:
+            current = self._live_attempts.get(worker_id)
+            if current is None or current.attempt != attempt:
+                return
+            pending = tuple(
+                item
+                for item in self._pending_approvals.values()
+                if item.worker_id == worker_id and item.attempt == attempt
+            )
+            if pending:
+                try:
+                    await self._store.expire_approval_requests(
+                        worker_id,
+                        expected_attempt=attempt,
+                        request_ids=tuple(item.request_id for item in pending),
+                    )
+                except AttemptChangedError:
+                    pass
+                else:
+                    await self._notify_event(worker_id)
+                for item in pending:
+                    self._pending_approvals.pop(item.request_id, None)
+                    if not item.future.done():
+                        decision: ApprovalDecision = (
+                            PermissionDecision("deny")
+                            if item.kind == "tool_permission"
+                            else ElicitationDecision("cancel")
+                        )
+                        item.future.set_result(decision)
+            self._live_attempts.pop(worker_id, None)
 
     def _task_finished(self, worker_id: str, completed: asyncio.Task[None]) -> None:
         self._tasks.pop(worker_id, None)
@@ -546,6 +588,13 @@ def _event_json(event: EventRecord) -> dict[str, JsonValue]:
         "timestamp": event.timestamp.isoformat(),
         "type": event.type,
         "payload": event.payload,
+    }
+
+
+def _copy_display(display: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
+    return {
+        key: list(value) if isinstance(value, list) else value
+        for key, value in display.items()
     }
 
 
@@ -610,9 +659,3 @@ def _approval_status(decision: ApprovalDecision) -> str:
     if isinstance(decision, PermissionDecision):
         return "allowed" if decision.action == "allow" else "denied"
     return "answered" if decision.action == "accept" else "denied"
-
-
-def _safe_identifier(value: str) -> bool:
-    if not value or len(value) > 128:
-        return False
-    return all(character.isalnum() or character in "._:-" for character in value)

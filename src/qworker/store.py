@@ -64,6 +64,10 @@ class EventRecord:
         return self.type
 
 
+class AttemptChangedError(RuntimeError):
+    """A conditional event write no longer targets its live attempt."""
+
+
 type _PayloadValidator = Callable[[JsonValue], bool]
 
 
@@ -85,6 +89,50 @@ def _non_negative_integer(value: JsonValue) -> bool:
 
 def _boolean(value: JsonValue) -> bool:
     return isinstance(value, bool)
+
+
+def _safe_display_text(value: JsonValue) -> bool:
+    if (
+        not isinstance(value, str)
+        or not value
+        or len(value) > 256
+        or "\x00" in value
+        or "\n" in value
+        or "\r" in value
+        or _INLINE_CREDENTIAL.search(value)
+        or _KEYED_CREDENTIAL.search(value)
+    ):
+        return False
+    return all(
+        not (secret and secret in value)
+        for secret in (os.environ.get(name) for name in _CREDENTIAL_ENV_VARS)
+    )
+
+
+def _approval_choices(value: JsonValue) -> bool:
+    return value in (["allow", "deny"], ["accept", "decline", "cancel"])
+
+
+def _display_fields(value: JsonValue) -> bool:
+    if not isinstance(value, list) or len(value) > 32:
+        return False
+    return all(
+        isinstance(item, str)
+        and re.fullmatch(
+            r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}:(?:array|boolean|integer|null|number|object|string|value)",
+            item,
+        )
+        is not None
+        for item in value
+    )
+
+
+def _required_display_fields(value: JsonValue) -> bool:
+    return (
+        isinstance(value, list)
+        and len(value) <= 32
+        and all(_IDENTIFIER(item) for item in value)
+    )
 
 
 def _one_of(*values: str) -> _PayloadValidator:
@@ -116,8 +164,8 @@ _INLINE_CREDENTIAL = re.compile(
     re.IGNORECASE,
 )
 _KEYED_CREDENTIAL = re.compile(
-    r"\b(?:api[_ -]?key|access[_ -]?token|secret|credential|password|authorization)"
-    r"\b(?:\s*[:=]\s*|\s+)[^\s,;]+",
+    r"\b(?:api[_ -]?key|access[_ -]?token|token|secret|credential|password|"
+    r"authorization)\b(?:\s*[:=]\s*|\s+)[^\s,;]+",
     re.IGNORECASE,
 )
 _RESULT_CREDENTIAL_KEY = re.compile(
@@ -253,8 +301,17 @@ _EVENT_SCHEMAS: dict[str, _EventSchema] = {
         required={
             "request_id": _IDENTIFIER,
             "kind": _one_of("tool_permission", "elicitation", "mcp_oauth"),
+            "prompt": _safe_display_text,
+            "choices": _approval_choices,
         },
-        optional={"agent_id": _IDENTIFIER},
+        optional={
+            "agent_id": _IDENTIFIER,
+            "tool_name": _IDENTIFIER,
+            "server_name": _IDENTIFIER,
+            "mode": _one_of("form", "url"),
+            "fields": _display_fields,
+            "required_fields": _required_display_fields,
+        },
     ),
     "approval.resolved": _EventSchema(
         required={
@@ -478,6 +535,173 @@ class WorkerStore:
             connection.rollback()
             raise
         return event
+
+    async def record_approval_request(
+        self,
+        worker_id: str,
+        *,
+        expected_attempt: int,
+        payload: Mapping[str, JsonValue],
+    ) -> tuple[EventRecord, ...]:
+        """Atomically persist a live-attempt request and requires-action state."""
+
+        safe_payload = _validated_payload("approval.requested", payload)
+        connection = self._open()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT attempt, state FROM workers WHERE worker_id = ?",
+                (worker_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown worker: {worker_id}")
+            attempt = int(row["attempt"])
+            state = cast(WorkerState, row["state"])
+            if attempt != expected_attempt or state not in (
+                "running",
+                "requires_action",
+            ):
+                raise AttemptChangedError("Approval attempt is no longer live.")
+            timestamp = _utc_now()
+            requested = self._append_event(
+                connection,
+                worker_id=worker_id,
+                attempt=expected_attempt,
+                event_type="approval.requested",
+                payload=safe_payload,
+                timestamp=timestamp,
+            )
+            events = [requested]
+            if state == "running":
+                state_event = self._append_event(
+                    connection,
+                    worker_id=worker_id,
+                    attempt=expected_attempt,
+                    event_type="worker.state_changed",
+                    payload={"schema_version": 1, "state": "requires_action"},
+                    timestamp=timestamp,
+                )
+                self._project_event(connection, state_event)
+                events.append(state_event)
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        return tuple(events)
+
+    async def record_approval_resolution(
+        self,
+        worker_id: str,
+        *,
+        expected_attempt: int,
+        payload: Mapping[str, JsonValue],
+        restore_running: bool,
+    ) -> tuple[EventRecord, ...]:
+        """Atomically persist one resolution and optional running transition."""
+
+        safe_payload = _validated_payload("approval.resolved", payload)
+        connection = self._open()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT attempt, state FROM workers WHERE worker_id = ?",
+                (worker_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown worker: {worker_id}")
+            if int(row["attempt"]) != expected_attempt or row["state"] != (
+                "requires_action"
+            ):
+                raise AttemptChangedError("Approval attempt is no longer live.")
+            timestamp = _utc_now()
+            resolved = self._append_event(
+                connection,
+                worker_id=worker_id,
+                attempt=expected_attempt,
+                event_type="approval.resolved",
+                payload=safe_payload,
+                timestamp=timestamp,
+            )
+            events = [resolved]
+            if restore_running:
+                state_event = self._append_event(
+                    connection,
+                    worker_id=worker_id,
+                    attempt=expected_attempt,
+                    event_type="worker.state_changed",
+                    payload={"schema_version": 1, "state": "running"},
+                    timestamp=timestamp,
+                )
+                self._project_event(connection, state_event)
+                events.append(state_event)
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        return tuple(events)
+
+    async def expire_approval_requests(
+        self,
+        worker_id: str,
+        *,
+        expected_attempt: int,
+        request_ids: tuple[str, ...],
+    ) -> tuple[EventRecord, ...]:
+        """Atomically close raced approvals before a completed attempt exits."""
+
+        if not request_ids:
+            return ()
+        payloads = tuple(
+            _validated_payload(
+                "approval.resolved",
+                {
+                    "schema_version": 1,
+                    "request_id": request_id,
+                    "status": "expired",
+                },
+            )
+            for request_id in request_ids
+        )
+        connection = self._open()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT attempt, state FROM workers WHERE worker_id = ?",
+                (worker_id,),
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"Unknown worker: {worker_id}")
+            if int(row["attempt"]) != expected_attempt or row["state"] != (
+                "requires_action"
+            ):
+                raise AttemptChangedError("Approval attempt is no longer live.")
+            timestamp = _utc_now()
+            events = [
+                self._append_event(
+                    connection,
+                    worker_id=worker_id,
+                    attempt=expected_attempt,
+                    event_type="approval.resolved",
+                    payload=payload,
+                    timestamp=timestamp,
+                )
+                for payload in payloads
+            ]
+            state_event = self._append_event(
+                connection,
+                worker_id=worker_id,
+                attempt=expected_attempt,
+                event_type="worker.state_changed",
+                payload={"schema_version": 1, "state": "running"},
+                timestamp=timestamp,
+            )
+            self._project_event(connection, state_event)
+            events.append(state_event)
+            connection.commit()
+        except BaseException:
+            connection.rollback()
+            raise
+        return tuple(events)
 
     async def record_result(
         self,
@@ -834,7 +1058,37 @@ def _validated_payload(
     for field, validator in validators.items():
         if field in copied and not validator(copied[field]):
             raise ValueError(f"Invalid semantic event payload field: {field}")
+    if event_type == "approval.requested":
+        _validate_approval_request_shape(copied)
     return copied
+
+
+def _validate_approval_request_shape(payload: Mapping[str, JsonValue]) -> None:
+    kind = payload["kind"]
+    choices = payload["choices"]
+    if kind == "tool_permission":
+        if choices != ["allow", "deny"] or "tool_name" not in payload:
+            raise ValueError("Invalid tool permission display shape.")
+        unexpected = set(payload).intersection(
+            {"server_name", "mode", "fields", "required_fields"}
+        )
+        if unexpected:
+            raise ValueError("Invalid tool permission display shape.")
+        return
+    if kind == "elicitation":
+        if (
+            choices != ["accept", "decline", "cancel"]
+            or "server_name" not in payload
+            or "mode" not in payload
+            or "tool_name" in payload
+        ):
+            raise ValueError("Invalid elicitation display shape.")
+        if payload["mode"] == "url" and (
+            "fields" in payload or "required_fields" in payload
+        ):
+            raise ValueError("URL elicitation cannot expose form fields.")
+        return
+    raise ValueError("MCP OAuth approval display is not supported.")
 
 
 def _validate_worker_creation(
