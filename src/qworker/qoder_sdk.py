@@ -121,6 +121,7 @@ def build_auditor_options(
     *,
     auth: AuthOptions | None = None,
     cli_path: Path | None = None,
+    resume: str | None = None,
 ) -> QoderAgentOptions:
     """Build isolated SDK options enforcing the auditor tool policy."""
 
@@ -146,6 +147,7 @@ def build_auditor_options(
         auth=auth,
         cwd=cwd,
         cli_path=cli_path,
+        resume=resume,
         setting_sources=[],
         tools=list(policy.visible_tools),
         allowed_tools=list(policy.visible_tools),
@@ -166,11 +168,19 @@ def create_default_transport(cwd: Path) -> "QoderSDKTransport":
     return QoderSDKTransport(QoderSDKClient(options=options))
 
 
+def create_resumed_transport(cwd: Path, session_id: str) -> "QoderSDKTransport":
+    """Create a fresh production transport resumed from stored conversation history."""
+
+    options = build_configured_auditor_options(cwd, resume=session_id)
+    return QoderSDKTransport(QoderSDKClient(options=options))
+
+
 def build_configured_auditor_options(
     cwd: Path,
     *,
     user_path: Path | None = None,
     environ: Mapping[str, str] | None = None,
+    resume: str | None = None,
 ) -> QoderAgentOptions:
     """Build worker options from validated config without reading credential values."""
 
@@ -206,6 +216,7 @@ def build_configured_auditor_options(
         cwd,
         auth=_sdk_auth(auth),
         cli_path=runtime_path,
+        resume=resume,
     )
 
 

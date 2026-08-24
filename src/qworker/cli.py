@@ -81,6 +81,14 @@ async def run(
             )
             _write_json(stdout, result)
             return 0
+        if arguments.command == "resume":
+            result = await call(
+                socket_path,
+                "resume",
+                {"worker_id": cast(str, arguments.worker_id)},
+            )
+            _write_json(stdout, result)
+            return 0
         if arguments.command == "watch":
             watch_params: dict[str, JsonValue] = {
                 "worker_id": cast(str, arguments.worker_id),
@@ -216,6 +224,10 @@ def _parser() -> _ArgumentParser:
     result = commands.add_parser("result")
     result.add_argument("worker_id")
     result.add_argument("--json", action="store_true")
+
+    resume = commands.add_parser("resume")
+    resume.add_argument("worker_id")
+    resume.add_argument("--json", action="store_true")
 
     watch_parser = commands.add_parser("watch")
     watch_parser.add_argument("worker_id")

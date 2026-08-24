@@ -198,6 +198,9 @@ class RPCServer:
         if method == "result":
             _validate_fields(params, required=("worker_id",))
             return await self._supervisor.result(_string(params, "worker_id"))
+        if method == "resume":
+            _validate_fields(params, required=("worker_id",))
+            return await self._supervisor.resume(_string(params, "worker_id"))
         if method == "steer":
             _validate_fields(
                 params,
@@ -706,7 +709,11 @@ async def run_server(socket_path: Path, state_dir: Path) -> None:
     """Run the production supervisor service until a termination signal arrives."""
 
     from qworker.preflight import RuntimePreflight
-    from qworker.qoder_sdk import QoderPreflightBackend, create_default_transport
+    from qworker.qoder_sdk import (
+        QoderPreflightBackend,
+        create_default_transport,
+        create_resumed_transport,
+    )
     from qworker.store import WorkerStore
 
     preflight = RuntimePreflight(QoderPreflightBackend())
@@ -715,6 +722,7 @@ async def run_server(socket_path: Path, state_dir: Path) -> None:
         create_default_transport,
         sdk_version=version("qoder-agent-sdk"),
         preflight=preflight.run,
+        resume_transport_factory=create_resumed_transport,
     )
     server = RPCServer(supervisor, socket_path)
     stopped = asyncio.Event()

@@ -2,7 +2,7 @@
 
 import asyncio
 import uuid
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -39,6 +39,13 @@ from qworker.transport import QoderTransport
 _TERMINAL_STATES = frozenset(("completed", "failed", "cancelled", "lost"))
 _STEERING_PRIORITIES = frozenset(("now", "next", "later"))
 _MAX_STOP_TIMEOUT = 10.0
+_RESUME_RECOVERY_MESSAGE = (
+    "The prior Qoder process ended before this conversation was finished. "
+    "Recheck the current workspace state before continuing. "
+    "Do not assume interrupted work completed."
+)
+
+type ResumeTransportFactory = Callable[[Path, str], QoderTransport]
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +88,7 @@ class Supervisor:
         runtime_path: str = "bundled",
         runtime_version: str | None = None,
         preflight: PreflightRunner | None = None,
+        resume_transport_factory: ResumeTransportFactory | None = None,
         settlement_timeout: float = 5.0,
         stop_timeout: float = _MAX_STOP_TIMEOUT,
     ) -> None:
@@ -92,6 +100,7 @@ class Supervisor:
         self._runtime_path = runtime_path
         self._runtime_version = runtime_version
         self._preflight = preflight
+        self._resume_transport_factory = resume_transport_factory
         self._settlement_timeout = settlement_timeout
         self._stop_timeout = min(stop_timeout, _MAX_STOP_TIMEOUT)
         self._tasks: dict[str, asyncio.Task[None]] = {}
@@ -159,6 +168,78 @@ class Supervisor:
             "cwd": str(worker.cwd),
             "event_cursor": 1,
         }
+
+    async def resume(self, worker_id: str) -> dict[str, JsonValue]:
+        """Start a fresh process using one eligible worker's conversation history."""
+
+        if self._closed:
+            raise SupervisorError("supervisor_unavailable", "Supervisor is closed.")
+        async with self._control_lock:
+            worker = await self._require_worker(worker_id)
+            if worker.state not in ("lost", "failed", "cancelled"):
+                raise SupervisorError(
+                    "resume_not_possible",
+                    "Worker state is not eligible for resume.",
+                )
+            if worker.session_id is None:
+                raise SupervisorError(
+                    "resume_not_possible",
+                    "Worker has no stored Qoder session.",
+                )
+            resume_factory = self._resume_transport_factory
+            if resume_factory is None:
+                raise SupervisorError(
+                    "resume_not_possible",
+                    "Resume transport is unavailable.",
+                )
+            try:
+                canonical_cwd = worker.cwd.resolve(strict=True)
+            except (OSError, RuntimeError):
+                raise SupervisorError(
+                    "resume_not_possible",
+                    "Worker's original working directory is unavailable.",
+                ) from None
+            if canonical_cwd != worker.cwd or not canonical_cwd.is_dir():
+                raise SupervisorError(
+                    "resume_not_possible",
+                    "Worker's original working directory is invalid.",
+                )
+
+            session_id = worker.session_id
+            attempt = await self._store.start_attempt(worker_id)
+            contract = AuditContract(
+                objective=_RESUME_RECOVERY_MESSAGE,
+                cwd=canonical_cwd,
+                requested_model=worker.requested_model,
+            )
+
+            def resumed_transport_factory(cwd: Path) -> QoderTransport:
+                return resume_factory(cwd, session_id)
+
+            task = asyncio.create_task(
+                self._run_worker(
+                    worker_id,
+                    attempt.attempt,
+                    contract,
+                    transport_factory=resumed_transport_factory,
+                ),
+                name=f"qworker:{worker_id}:attempt-{attempt.attempt}",
+            )
+            self._tasks[worker_id] = task
+
+            def task_finished(completed: asyncio.Task[None]) -> None:
+                self._task_finished(worker_id, completed)
+
+            task.add_done_callback(task_finished)
+            cursor = await self._store.latest_event_cursor(worker_id)
+            return {
+                "worker_id": worker_id,
+                "state": attempt.state,
+                "role": worker.role,
+                "cwd": str(canonical_cwd),
+                "attempt": attempt.attempt,
+                "event_cursor": cursor,
+            }
 
     async def status(self, worker_id: str) -> dict[str, JsonValue]:
         """Return durable current worker state and latest persisted cursor."""
@@ -586,12 +667,18 @@ class Supervisor:
         await self._store.close()
 
     async def _run_worker(
-        self, worker_id: str, attempt: int, contract: AuditContract
+        self,
+        worker_id: str,
+        attempt: int,
+        contract: AuditContract,
+        *,
+        transport_factory: TransportFactory | None = None,
     ) -> None:
         initialized = False
+        selected_transport_factory = transport_factory or self._transport_factory
 
         def owned_transport_factory(cwd: Path) -> QoderTransport:
-            transport = self._transport_factory(cwd)
+            transport = selected_transport_factory(cwd)
 
             async def request_permission(
                 request: PermissionRequest,
@@ -935,7 +1022,8 @@ class Supervisor:
             )
 
     def _task_finished(self, worker_id: str, completed: asyncio.Task[None]) -> None:
-        self._tasks.pop(worker_id, None)
+        if self._tasks.get(worker_id) is completed:
+            self._tasks.pop(worker_id, None)
         if not completed.cancelled():
             with suppress(asyncio.CancelledError):
                 completed.exception()
