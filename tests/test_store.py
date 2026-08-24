@@ -173,3 +173,40 @@ async def test_store_rejects_unversioned_or_nonsemantic_payloads(
     assert [event.type for event in await store.events_since(worker.worker_id)] == [
         "worker.created"
     ]
+
+
+@pytest.mark.parametrize(
+    ("event_type", "payload"),
+    (
+        ("model.resolved", {"schema_version": 1, "model": "sk-live-secret"}),
+        (
+            "model.resolved",
+            {"schema_version": 1, "model": "this is a raw assistant transcript"},
+        ),
+        ("tool.started", {"schema_version": 1, "tool_name": "Bearer secret"}),
+        ("worker.warning", {"schema_version": 1, "code": "api_key_ABC123"}),
+        (
+            "runtime.initialized",
+            {"schema_version": 1, "runtime_version": "credential-value"},
+        ),
+    ),
+)
+async def test_store_rejects_sensitive_or_free_form_allowed_values(
+    tmp_path: Path,
+    event_type: str,
+    payload: dict[str, object],
+) -> None:
+    store = WorkerStore(tmp_path / "state")
+    worker = await store.create_worker(
+        role="auditor",
+        cwd=tmp_path,
+        write_capability="read_only",
+        requested_model="qwen-auditor",
+        runtime_path="bundled",
+        sdk_version="1.0.13",
+    )
+
+    with pytest.raises(ValueError, match="semantic event payload"):
+        await store.append_event(worker.worker_id, event_type, payload)  # type: ignore[arg-type]
+
+    assert len(await store.events_since(worker.worker_id)) == 1

@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import secrets
 import sqlite3
 import time
@@ -74,13 +75,6 @@ def _boolean(value: JsonValue) -> bool:
     return isinstance(value, bool)
 
 
-def _bounded_string(maximum_length: int) -> _PayloadValidator:
-    def validate(value: JsonValue) -> bool:
-        return isinstance(value, str) and 0 < len(value) <= maximum_length
-
-    return validate
-
-
 def _one_of(*values: str) -> _PayloadValidator:
     allowed = frozenset(values)
 
@@ -90,11 +84,54 @@ def _one_of(*values: str) -> _PayloadValidator:
     return validate
 
 
-_IDENTIFIER = _bounded_string(128)
-_CODE = _bounded_string(128)
-_MODEL = _bounded_string(256)
-_PATH = _bounded_string(4096)
-_RUNTIME_VERSION = _bounded_string(256)
+_METADATA = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
+_VERSION = re.compile(
+    r"v?\d+(?:\.\d+){1,3}(?:[-+][A-Za-z0-9._-]{1,64})?\Z", re.IGNORECASE
+)
+_CREDENTIAL_MARKER = re.compile(
+    r"(?:^sk[-_]|^pk[-_]|^bearer[._ -]|api[_-]?key|access[_-]?token|secret|credential|password|authorization)",
+    re.IGNORECASE,
+)
+_JWT = re.compile(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\Z")
+_AWS_ACCESS_KEY = re.compile(r"AKIA[A-Z0-9]{16}\Z")
+
+
+def _safe_metadata(value: JsonValue) -> bool:
+    """Accept identifier-shaped metadata, never free-form text or credentials."""
+
+    if not isinstance(value, str) or _METADATA.fullmatch(value) is None:
+        return False
+    return not (
+        _CREDENTIAL_MARKER.search(value)
+        or _JWT.fullmatch(value)
+        or _AWS_ACCESS_KEY.fullmatch(value)
+    )
+
+
+def _safe_runtime_version(value: JsonValue) -> bool:
+    return (
+        isinstance(value, str)
+        and _VERSION.fullmatch(value) is not None
+        and not _CREDENTIAL_MARKER.search(value)
+    )
+
+
+def _absolute_path(value: JsonValue) -> bool:
+    return (
+        isinstance(value, str)
+        and value.startswith("/")
+        and len(value) <= 4096
+        and "\x00" not in value
+        and "\n" not in value
+        and "\r" not in value
+    )
+
+
+_IDENTIFIER = _safe_metadata
+_CODE = _safe_metadata
+_MODEL = _safe_metadata
+_PATH = _absolute_path
+_RUNTIME_VERSION = _safe_runtime_version
 _EVENT_SCHEMAS: dict[str, _EventSchema] = {
     "worker.created": _EventSchema(
         required={
@@ -339,6 +376,8 @@ class WorkerStore:
 
         connection = self._open()
         safe_payload = _validated_payload(event_type, payload)
+        if event_type == "worker.created":
+            raise ValueError("Use create_worker() to persist worker.created.")
         if event_type == "worker.state_changed" and safe_payload["state"] == "starting":
             raise ValueError(
                 "Use start_attempt() to create a resumed starting attempt."
