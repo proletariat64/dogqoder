@@ -116,15 +116,33 @@ def _safe_runtime_version(value: JsonValue) -> bool:
     )
 
 
-def _absolute_path(value: JsonValue) -> bool:
-    return (
-        isinstance(value, str)
-        and value.startswith("/")
-        and len(value) <= 4096
-        and "\x00" not in value
-        and "\n" not in value
-        and "\r" not in value
+def _contains_sensitive_marker(value: str) -> bool:
+    return bool(
+        _CREDENTIAL_MARKER.search(value)
+        or _JWT.fullmatch(value)
+        or _AWS_ACCESS_KEY.fullmatch(value)
     )
+
+
+def _absolute_path(value: JsonValue) -> bool:
+    if (
+        not isinstance(value, str)
+        or not value.startswith("/")
+        or len(value) > 4096
+        or "\x00" in value
+        or "\n" in value
+        or "\r" in value
+    ):
+        return False
+    return all(
+        not _contains_sensitive_marker(part) and len(part.split()) <= 2
+        for part in value.split("/")
+        if part
+    )
+
+
+def _runtime_path(value: JsonValue) -> bool:
+    return value == "bundled" or _absolute_path(value)
 
 
 _IDENTIFIER = _safe_metadata
@@ -254,9 +272,17 @@ class WorkerStore:
     ) -> WorkerRecord:
         """Create a stable worker identity with its first positive attempt."""
 
-        connection = self._open()
         worker_identifier = worker_id or _new_ulid()
         canonical_cwd = cwd.resolve(strict=False)
+        _validate_worker_creation(
+            worker_id=worker_identifier,
+            cwd=canonical_cwd,
+            requested_model=requested_model,
+            runtime_path=runtime_path,
+            runtime_version=runtime_version,
+            sdk_version=sdk_version,
+        )
+        connection = self._open()
         created_at = _utc_now()
         created_at_text = _dump_timestamp(created_at)
         try:
@@ -679,6 +705,31 @@ def _validated_payload(
         if field in copied and not validator(copied[field]):
             raise ValueError(f"Invalid semantic event payload field: {field}")
     return copied
+
+
+def _validate_worker_creation(
+    *,
+    worker_id: str,
+    cwd: Path,
+    requested_model: str,
+    runtime_path: str,
+    runtime_version: str | None,
+    sdk_version: str,
+) -> None:
+    """Reject unsafe public worker metadata before any SQLite write begins."""
+
+    values: tuple[tuple[str, JsonValue, _PayloadValidator], ...] = (
+        ("worker_id", worker_id, _IDENTIFIER),
+        ("cwd", str(cwd), _PATH),
+        ("requested_model", requested_model, _MODEL),
+        ("runtime_path", runtime_path, _runtime_path),
+        ("sdk_version", sdk_version, _RUNTIME_VERSION),
+    )
+    for field, value, validator in values:
+        if not validator(value):
+            raise ValueError(f"Unsafe worker creation field: {field}")
+    if runtime_version is not None and not _RUNTIME_VERSION(runtime_version):
+        raise ValueError("Unsafe worker creation field: runtime_version")
 
 
 def _copy_json_object(payload: Mapping[str, JsonValue]) -> dict[str, JsonValue]:

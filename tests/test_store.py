@@ -210,3 +210,40 @@ async def test_store_rejects_sensitive_or_free_form_allowed_values(
         await store.append_event(worker.worker_id, event_type, payload)  # type: ignore[arg-type]
 
     assert len(await store.events_since(worker.worker_id)) == 1
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    (
+        ("requested_model", "sk-live-secret"),
+        ("runtime_path", "a raw runtime transcript"),
+        ("runtime_version", "credential-value"),
+        ("sdk_version", "Bearer secret"),
+        ("cwd", Path("/workspace/sk-live-secret")),
+        ("worker_id", "sk-live-secret"),
+    ),
+)
+async def test_create_worker_rejects_unsafe_ingress_without_persisting(
+    tmp_path: Path,
+    field: str,
+    invalid_value: object,
+) -> None:
+    store = WorkerStore(tmp_path / "state")
+    worker_arguments: dict[str, object] = {
+        "role": "auditor",
+        "cwd": tmp_path,
+        "write_capability": "read_only",
+        "requested_model": "qwen-auditor",
+        "runtime_path": "bundled",
+        "sdk_version": "1.0.13",
+        "worker_id": "worker-1",
+    }
+    worker_arguments[field] = invalid_value
+
+    with pytest.raises(ValueError, match="worker creation field"):
+        await store.create_worker(**worker_arguments)  # type: ignore[arg-type]
+
+    assert await store.events_since("worker-1") == ()
+    with sqlite3.connect(store.database_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM workers").fetchone() == (0,)
+        assert connection.execute("SELECT COUNT(*) FROM events").fetchone() == (0,)
