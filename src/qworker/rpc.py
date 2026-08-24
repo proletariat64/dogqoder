@@ -668,13 +668,16 @@ def default_state_dir() -> Path:
 async def run_server(socket_path: Path, state_dir: Path) -> None:
     """Run the production supervisor service until a termination signal arrives."""
 
-    from qworker.qoder_sdk import create_default_transport
+    from qworker.preflight import RuntimePreflight
+    from qworker.qoder_sdk import QoderPreflightBackend, create_default_transport
     from qworker.store import WorkerStore
 
+    preflight = RuntimePreflight(QoderPreflightBackend())
     supervisor = Supervisor(
         WorkerStore(state_dir),
         create_default_transport,
         sdk_version=version("qoder-agent-sdk"),
+        preflight=preflight.run,
     )
     server = RPCServer(supervisor, socket_path)
     stopped = asyncio.Event()

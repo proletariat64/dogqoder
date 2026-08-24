@@ -3,6 +3,8 @@
 import asyncio
 import json
 import os
+import platform
+import re
 import tempfile
 from collections.abc import (
     AsyncIterable,
@@ -12,6 +14,9 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
+from dataclasses import dataclass
+from importlib.metadata import version
+from importlib.resources import files
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
 
@@ -42,6 +47,8 @@ from qoder_agent_sdk import (
     ToolPermissionContext,
     ToolUseBlock,
     access_token_from_env,
+    qodercli_auth,
+    service_account_from_env,
 )
 from qoder_agent_sdk import (
     ElicitationRequest as SDKElicitationRequest,
@@ -51,6 +58,7 @@ from qoder_agent_sdk import (
 )
 
 from qworker.auditor_policy import AuditorToolPolicy
+from qworker.config import ConfigError, load_config
 from qworker.control import (
     ControlCallbacks,
     ElicitationDecision,
@@ -69,6 +77,12 @@ from qworker.events import (
     TaskTerminalEvent,
 )
 from qworker.model_policy import AvailableModel
+from qworker.preflight import (
+    AuthSelection,
+    PreflightFailure,
+    RuntimeInfo,
+    select_auth,
+)
 
 _CREDENTIAL_ENV_VARS = (
     "QODER_PERSONAL_ACCESS_TOKEN",
@@ -78,11 +92,15 @@ _CREDENTIAL_ENV_VARS = (
 )
 _MAX_SYSTEM_DIAGNOSTIC_CHARS = 512
 _MISSING = object()
+_MINIMUM_RUNTIME_VERSION = (0, 2, 0)
+_RUNTIME_VERSION = re.compile(r"^\s*([0-9]+)\.([0-9]+)\.([0-9]+)")
 
 type AdapterDiagnosticCode = Literal[
     "auth_required",
     "initialize_timeout",
+    "invalid_request",
     "runtime_not_found",
+    "runtime_incompatible",
     "sdk_protocol_error",
 ]
 
@@ -100,6 +118,7 @@ def build_auditor_options(
     cwd: str | Path,
     *,
     auth: AuthOptions | None = None,
+    cli_path: Path | None = None,
 ) -> QoderAgentOptions:
     """Build isolated SDK options enforcing the auditor tool policy."""
 
@@ -124,6 +143,7 @@ def build_auditor_options(
     return QoderAgentOptions(
         auth=auth,
         cwd=cwd,
+        cli_path=cli_path,
         setting_sources=[],
         tools=list(policy.visible_tools),
         allowed_tools=list(policy.visible_tools),
@@ -138,15 +158,252 @@ def build_auditor_options(
 
 
 def create_default_transport(cwd: Path) -> "QoderSDKTransport":
-    """Create the production transport using unattended PAT authentication."""
+    """Create production transport from the same config/auth policy as preflight."""
 
-    if not os.environ.get("QODER_PERSONAL_ACCESS_TOKEN"):
-        raise AdapterDiagnostic(
-            "auth_required",
-            "Set QODER_PERSONAL_ACCESS_TOKEN before starting a Qoder audit.",
-        )
-    options = build_auditor_options(cwd, auth=access_token_from_env())
+    options = build_configured_auditor_options(cwd)
     return QoderSDKTransport(QoderSDKClient(options=options))
+
+
+def build_configured_auditor_options(
+    cwd: Path,
+    *,
+    user_path: Path | None = None,
+    environ: Mapping[str, str] | None = None,
+) -> QoderAgentOptions:
+    """Build worker options from validated config without reading credential values."""
+
+    selected_environment = os.environ if environ is None else environ
+    try:
+        config = load_config(cwd, user_path=user_path)
+        auth = select_auth(config, selected_environment)
+        if config.runtime_path is None:
+            runtime_path = _bundled_runtime_path()
+        else:
+            try:
+                runtime_path = config.runtime_path.resolve(strict=True)
+            except OSError:
+                raise PreflightFailure(
+                    "runtime_not_found", "Configured Qoder runtime was not found."
+                ) from None
+            if not runtime_path.is_file() or not os.access(runtime_path, os.X_OK):
+                raise PreflightFailure(
+                    "runtime_not_found",
+                    "Configured Qoder runtime is not executable.",
+                )
+    except ConfigError as error:
+        raise AdapterDiagnostic("invalid_request", error.message) from None
+    except PreflightFailure as error:
+        if error.code not in {
+            "auth_required",
+            "runtime_not_found",
+            "runtime_incompatible",
+        }:
+            raise AdapterDiagnostic("sdk_protocol_error", error.message) from None
+        raise AdapterDiagnostic(cast(AdapterDiagnosticCode, error.code), error.message) from None
+    return build_auditor_options(
+        cwd,
+        auth=_sdk_auth(auth),
+        cli_path=runtime_path,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class CommandResult:
+    """Bounded subprocess observation used for runtime diagnostics."""
+
+    returncode: int
+    stdout: str = ""
+
+
+class _ControlClient(Protocol):
+    async def connect(self, prompt: None = None) -> None: ...
+
+    async def get_server_info(self) -> Mapping[str, object] | None: ...
+
+    async def disconnect(self) -> None: ...
+
+
+type ControlClientFactory = Callable[[QoderAgentOptions], object]
+type CommandRunner = Callable[[tuple[str, ...]], Awaitable[CommandResult]]
+
+
+class QoderPreflightBackend:
+    """Pinned public-SDK backend for runtime and control preflight."""
+
+    def __init__(
+        self,
+        *,
+        client_factory: ControlClientFactory | None = None,
+        command_runner: CommandRunner | None = None,
+    ) -> None:
+        self._client_factory = client_factory or _new_control_client
+        self._command_runner = command_runner or _run_runtime_command
+
+    def sdk_version(self) -> str:
+        return version("qoder-agent-sdk")
+
+    async def resolve_runtime(self, explicit_path: Path | None) -> RuntimeInfo:
+        recorded_path = "bundled"
+        if explicit_path is None:
+            executable = _bundled_runtime_path()
+        else:
+            try:
+                executable = explicit_path.resolve(strict=True)
+            except OSError:
+                raise PreflightFailure(
+                    "runtime_not_found", "Configured Qoder runtime was not found."
+                ) from None
+            recorded_path = str(executable)
+        if not executable.is_file() or not os.access(executable, os.X_OK):
+            raise PreflightFailure(
+                "runtime_not_found", "Configured Qoder runtime is not executable."
+            )
+        try:
+            result = await self._command_runner((str(executable), "-v"))
+        except PreflightFailure:
+            raise
+        except Exception:  # noqa: BLE001 -- injected runner is a system boundary
+            raise PreflightFailure(
+                "runtime_incompatible", "Unable to read Qoder runtime version."
+            ) from None
+        if result.returncode != 0:
+            raise PreflightFailure(
+                "runtime_incompatible", "Unable to read Qoder runtime version."
+            )
+        match = _RUNTIME_VERSION.match(result.stdout)
+        if match is None:
+            raise PreflightFailure(
+                "runtime_incompatible", "Qoder runtime returned an invalid version."
+            )
+        version_parts = tuple(int(part) for part in match.groups())
+        if version_parts < _MINIMUM_RUNTIME_VERSION:
+            raise PreflightFailure(
+                "runtime_incompatible",
+                "Qoder runtime does not satisfy the SDK minimum version.",
+            )
+        runtime_version = ".".join(match.groups())
+        return RuntimeInfo(recorded_path, executable, runtime_version)
+
+    async def initialize(
+        self,
+        cwd: Path,
+        runtime: RuntimeInfo,
+        auth: AuthSelection,
+    ) -> tuple[str, ...]:
+        sdk_auth = _sdk_auth(auth)
+        options = build_auditor_options(
+            cwd,
+            auth=sdk_auth,
+            cli_path=runtime.executable,
+        )
+        client = cast(_ControlClient, self._client_factory(options))
+        credential_values = _direct_credential_values(client)
+        primary_error: Exception | None = None
+        server_info: Mapping[str, object] | None = None
+        try:
+            await client.connect(None)
+            server_info = await client.get_server_info()
+            if server_info is None:
+                raise AdapterDiagnostic(
+                    "sdk_protocol_error",
+                    "Qoder runtime returned no initialization information.",
+                )
+        except Exception as error:  # noqa: BLE001 -- classified below
+            primary_error = error
+        finally:
+            try:
+                await client.disconnect()
+            except Exception as error:  # noqa: BLE001 -- classified below
+                if primary_error is None:
+                    primary_error = error
+        if primary_error is not None:
+            diagnostic = classify_sdk_error(
+                primary_error,
+                operation="initialize",
+                credential_values=credential_values,
+            )
+            raise PreflightFailure(diagnostic.code, diagnostic.message) from None
+        assert server_info is not None
+        raw_capabilities = server_info.get("capabilities", {})
+        if not isinstance(raw_capabilities, Mapping):
+            return ()
+        return tuple(
+            sorted(
+                key
+                for key in raw_capabilities
+                if isinstance(key, str)
+                and 0 < len(key) <= 128
+                and _redact(key, credential_values) == key
+            )
+        )
+
+    async def local_login_status(self, runtime: RuntimeInfo) -> bool:
+        try:
+            result = await self._command_runner(
+                (str(runtime.executable), "status")
+            )
+        except Exception:  # noqa: BLE001 -- command output is deliberately discarded
+            return False
+        return result.returncode == 0
+
+
+def _new_control_client(options: QoderAgentOptions) -> object:
+    return QoderSDKClient(options=options)
+
+
+def _bundled_runtime_path() -> Path:
+    runtime_name = "qodercli.exe" if platform.system() == "Windows" else "qodercli"
+    bundled = Path(str(files("qoder_agent_sdk").joinpath("_bundled", runtime_name)))
+    try:
+        return bundled.resolve(strict=True)
+    except OSError:
+        raise PreflightFailure(
+            "runtime_not_found", "Bundled Qoder runtime was not found."
+        ) from None
+
+
+async def _run_runtime_command(command: tuple[str, ...]) -> CommandResult:
+    process: asyncio.subprocess.Process | None = None
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        async with asyncio.timeout(5):
+            stdout, _ = await process.communicate()
+    except FileNotFoundError:
+        raise PreflightFailure(
+            "runtime_not_found", "Qoder runtime was not found."
+        ) from None
+    except TimeoutError:
+        if process is not None and process.returncode is None:
+            process.kill()
+            await process.wait()
+        raise PreflightFailure(
+            "runtime_incompatible", "Qoder runtime command timed out."
+        ) from None
+    return CommandResult(
+        returncode=process.returncode or 0,
+        stdout=stdout[:4096].decode("utf-8", errors="replace"),
+    )
+
+
+def _sdk_auth(auth: AuthSelection) -> AuthOptions:
+    if auth.source == "personal_access_token":
+        if auth.env_var is None:
+            raise PreflightFailure(
+                "auth_required", "Personal access-token environment is missing."
+            )
+        return access_token_from_env(auth.env_var)
+    if auth.source == "service_account":
+        if auth.env_var is None:
+            raise PreflightFailure(
+                "auth_required", "Service-account environment is missing."
+            )
+        return service_account_from_env(auth.env_var)
+    return qodercli_auth()
 
 
 type SDKOperation = Literal[

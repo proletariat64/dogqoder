@@ -10,6 +10,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import NoReturn, TextIO, cast
 
+from qworker.preflight import DoctorResult, PreflightRunner, RuntimePreflight
 from qworker.rpc import RPCClientError, call, default_state_dir, watch
 from qworker.store import JsonValue
 
@@ -28,12 +29,21 @@ async def run(
     *,
     stdin: TextIO,
     stdout: TextIO,
+    doctor_runner: PreflightRunner | None = None,
 ) -> int:
     """Run one CLI invocation and return its process exit code."""
 
     try:
         arguments = _parser().parse_args(argv)
         socket_path = cast(Path, arguments.socket)
+        if arguments.command == "doctor":
+            doctor_result = await (
+                _run_default_doctor(Path.cwd())
+                if doctor_runner is None
+                else doctor_runner(Path.cwd())
+            )
+            _write_json(stdout, doctor_result.to_json())
+            return 0 if doctor_result.ok else 1
         if arguments.command == "spawn":
             objective = _read_objective(arguments.spec_file, stdin)
             params: dict[str, JsonValue] = {
@@ -228,7 +238,16 @@ def _parser() -> _ArgumentParser:
     respond.add_argument("request_id")
     respond.add_argument("--response-file", type=Path)
     respond.add_argument("--json", action="store_true")
+
+    doctor = commands.add_parser("doctor")
+    doctor.add_argument("--json", action="store_true")
     return parser
+
+
+async def _run_default_doctor(cwd: Path) -> DoctorResult:
+    from qworker.qoder_sdk import QoderPreflightBackend
+
+    return await RuntimePreflight(QoderPreflightBackend()).run(cwd)
 
 
 def _read_objective(spec_file: Path | None, stdin: TextIO) -> str:

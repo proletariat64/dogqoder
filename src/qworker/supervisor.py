@@ -27,6 +27,7 @@ from qworker.control import (
 )
 from qworker.domain import AuditContract, AuditResult
 from qworker.lifecycle import WorkerRecord
+from qworker.preflight import PreflightRunner
 from qworker.store import AttemptChangedError, EventRecord, JsonValue, WorkerStore
 from qworker.transport import QoderTransport
 
@@ -67,6 +68,7 @@ class Supervisor:
         sdk_version: str,
         runtime_path: str = "bundled",
         runtime_version: str | None = None,
+        preflight: PreflightRunner | None = None,
         settlement_timeout: float = 5.0,
         stop_timeout: float = _MAX_STOP_TIMEOUT,
     ) -> None:
@@ -77,6 +79,7 @@ class Supervisor:
         self._sdk_version = sdk_version
         self._runtime_path = runtime_path
         self._runtime_version = runtime_version
+        self._preflight = preflight
         self._settlement_timeout = settlement_timeout
         self._stop_timeout = min(stop_timeout, _MAX_STOP_TIMEOUT)
         self._tasks: dict[str, asyncio.Task[None]] = {}
@@ -94,14 +97,33 @@ class Supervisor:
 
         if self._closed:
             raise SupervisorError("supervisor_unavailable", "Supervisor is closed.")
+        sdk_version = self._sdk_version
+        runtime_path = self._runtime_path
+        runtime_version = self._runtime_version
+        if self._preflight is not None:
+            preflight = await self._preflight(contract.cwd)
+            if not preflight.ok:
+                diagnostic = preflight.error
+                if diagnostic is None:
+                    raise SupervisorError(
+                        "sdk_protocol_error", "Qoder preflight returned no diagnostic."
+                    )
+                raise SupervisorError(diagnostic.code, diagnostic.message)
+            if preflight.sdk_version is None or preflight.runtime_path is None:
+                raise SupervisorError(
+                    "sdk_protocol_error", "Qoder preflight returned incomplete metadata."
+                )
+            sdk_version = preflight.sdk_version
+            runtime_path = preflight.runtime_path
+            runtime_version = preflight.runtime_version
         worker = await self._store.create_worker(
             role="auditor",
             cwd=contract.cwd,
             write_capability="read_only",
             requested_model=contract.requested_model,
-            runtime_path=self._runtime_path,
-            runtime_version=self._runtime_version,
-            sdk_version=self._sdk_version,
+            runtime_path=runtime_path,
+            runtime_version=runtime_version,
+            sdk_version=sdk_version,
         )
         task = asyncio.create_task(
             self._run_worker(worker.worker_id, worker.attempt, contract),
