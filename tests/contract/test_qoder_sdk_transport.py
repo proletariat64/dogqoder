@@ -1,3 +1,4 @@
+import json
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -7,6 +8,7 @@ from qoder_agent_sdk import (
     AssistantMessage,
     AuthOptions,
     ModelUsage,
+    PermissionResultAllow,
     PermissionResultDeny,
     QoderAgentOptions,
     ResultMessage,
@@ -25,6 +27,13 @@ from qoder_agent_sdk import (
     service_account_from_env,
 )
 
+from qworker.audit_report import (
+    AUDIT_REPORT_KEYS,
+    AUDIT_REPORT_MCP_SERVER,
+    AUDIT_REPORT_SCHEMA,
+    SUBMIT_AUDIT_TOOL,
+    AuditReportCapture,
+)
 from qworker.auditor_policy import AuditorToolPolicy
 from qworker.events import (
     AssistantEvent,
@@ -39,6 +48,7 @@ from qworker.qoder_sdk import (
     AdapterDiagnostic,
     QoderSDKTransport,
     build_auditor_options,
+    create_default_transport,
 )
 
 type FailingOperation = Literal[
@@ -182,6 +192,153 @@ async def test_nested_mutation_is_denied_at_callback_boundary(
     decision = await options.can_use_tool("Write", {"file_path": "x"}, context)
 
     assert isinstance(decision, PermissionResultDeny)
+
+
+async def test_auditor_options_register_top_level_submit_audit_tool(
+    tmp_path: Path,
+) -> None:
+    capture = AuditReportCapture()
+    options = build_auditor_options(tmp_path, report_capture=capture)
+
+    assert isinstance(options.mcp_servers, dict)
+    assert options.mcp_servers[AUDIT_REPORT_MCP_SERVER]["type"] == "sdk"
+    assert set(AUDIT_REPORT_SCHEMA["required"]) == AUDIT_REPORT_KEYS
+    assert AUDIT_REPORT_SCHEMA["additionalProperties"] is False
+    assert options.allowed_mcp_server_names == [AUDIT_REPORT_MCP_SERVER]
+    assert options.strict_mcp_config is True
+    assert SUBMIT_AUDIT_TOOL in options.tools
+    assert SUBMIT_AUDIT_TOOL not in options.allowed_tools
+    assert options.can_use_tool is not None
+    top_level = await options.can_use_tool(
+        SUBMIT_AUDIT_TOOL,
+        {},
+        ToolPermissionContext(agent_id=None),
+    )
+    nested = await options.can_use_tool(
+        SUBMIT_AUDIT_TOOL,
+        {},
+        ToolPermissionContext(agent_id="nested-auditor"),
+    )
+
+    assert isinstance(top_level, PermissionResultAllow)
+    assert isinstance(nested, PermissionResultDeny)
+
+
+async def test_submitted_audit_report_overrides_terminal_free_text() -> None:
+    submitted = {
+        "outcome": "completed",
+        "summary": "safe",
+        "files": ["README.md"],
+        "validation": ["read-only inspection"],
+        "risks": [],
+        "verdict": "approved",
+        "confirmed": ["workspace unchanged"],
+        "findings": [],
+        "required_changes": [],
+    }
+    capture = AuditReportCapture()
+    capture.record(submitted)
+    client = FakeSDKClient(
+        models=[],
+        sdk_messages=[
+            ResultMessage(
+                subtype="success",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="session-1",
+                result="unstructured terminal prose",
+            )
+        ],
+    )
+
+    events = [
+        event
+        async for event in QoderSDKTransport(
+            client,
+            report_capture=capture,
+        ).messages()
+    ]
+
+    assert len(events) == 1
+    event = events[0]
+    assert isinstance(event, ResultEvent)
+    assert event.result is not None
+    assert json.loads(event.result) == submitted
+
+
+async def test_submitted_audit_report_redacts_json_escaped_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    credential = 'opaque"credential'
+    monkeypatch.setenv("QODER_PERSONAL_ACCESS_TOKEN", credential)
+    capture = AuditReportCapture()
+    assert capture.record(
+        {
+            "outcome": "completed",
+            "summary": f"credential={credential}",
+            "files": [],
+            "validation": [],
+            "risks": [],
+            "verdict": "approved",
+            "confirmed": [],
+            "findings": [],
+            "required_changes": [],
+        }
+    )
+    client = FakeSDKClient(
+        models=[],
+        sdk_messages=[
+            ResultMessage(
+                subtype="success",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="session-1",
+                result="ignored",
+            )
+        ],
+    )
+
+    events = [
+        event
+        async for event in QoderSDKTransport(
+            client,
+            report_capture=capture,
+        ).messages()
+    ]
+
+    event = events[0]
+    assert isinstance(event, ResultEvent)
+    assert event.result is not None
+    assert credential not in event.result
+    assert json.loads(event.result)["summary"] == "credential=[REDACTED]"
+
+
+def test_default_transport_registers_one_report_channel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clients: list[FakeSDKClient] = []
+
+    def client_factory(options: QoderAgentOptions) -> FakeSDKClient:
+        client = FakeSDKClient(models=[], options=options)
+        clients.append(client)
+        return client
+
+    monkeypatch.setenv("QODER_PERSONAL_ACCESS_TOKEN", "opaque")
+    monkeypatch.setattr("qworker.qoder_sdk.QoderSDKClient", client_factory)
+
+    transport = create_default_transport(tmp_path)
+
+    assert isinstance(transport, QoderSDKTransport)
+    assert len(clients) == 1
+    options = clients[0].options
+    assert options is not None
+    assert isinstance(options.mcp_servers, dict)
+    assert set(options.mcp_servers) == {AUDIT_REPORT_MCP_SERVER}
 
 
 def test_auditor_options_are_layered_and_isolated(tmp_path: Path) -> None:

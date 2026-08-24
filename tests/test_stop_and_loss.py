@@ -10,6 +10,7 @@ import pytest
 from qoder_agent_sdk import ProcessError
 
 from qworker.cli import run
+from qworker.coder import CoderContract
 from qworker.control import ControlCallbacks, PermissionRequest
 from qworker.domain import AuditContract
 from qworker.events import AdapterEvent, ResultEvent, TaskStartedEvent
@@ -662,20 +663,38 @@ async def test_eof_during_nested_settlement_preserves_main_result(
     await supervisor.close()
 
 
-async def test_result_wins_a_graceful_stop_race(tmp_path: Path) -> None:
+@pytest.mark.parametrize("role", ("auditor", "coder"))
+async def test_graceful_stop_wins_result_released_by_interrupt(
+    tmp_path: Path,
+    role: str,
+) -> None:
     order: list[str] = []
     transport = StoppableFakeQoderTransport(order, result_after_interrupt=True)
     supervisor = Supervisor(
         WorkerStore(tmp_path / "state"),
         lambda _cwd: transport,
+        coder_transport_factory=lambda _cwd: transport,
         sdk_version="1.0.13",
         stop_timeout=0.1,
     )
-    worker_id = await _spawn_running(supervisor, tmp_path)
+    if role == "auditor":
+        worker_id = await _spawn_running(supervisor, tmp_path)
+    else:
+        accepted = await supervisor.spawn(
+            CoderContract(objective="exercise coder stop", cwd=tmp_path)
+        )
+        worker_id = str(accepted["worker_id"])
+        for _ in range(100):
+            if (await supervisor.status(worker_id))["state"] == "running":
+                break
+            await asyncio.sleep(0)
+        else:
+            raise AssertionError("coder did not enter running state")
 
     stopped = await supervisor.stop(worker_id)
 
-    assert stopped["state"] == "completed"
+    assert stopped["state"] == "cancelled"
+    assert stopped["health"] == "exited"
     result = await supervisor.result(worker_id)
     assert result is not None
     assert result["session_id"] == "session-after-interrupt"

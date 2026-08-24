@@ -25,6 +25,7 @@ from qworker.transport import QoderTransport
 type CoderOutcome = Literal["completed", "partial", "blocked", "failed"]
 type TransportFactory = Callable[[Path], QoderTransport]
 type InitializationObserver = Callable[[str], Awaitable[None]]
+type ResultObserver = Callable[[], None]
 
 _DEFAULT_SETTLEMENT_TIMEOUT = 5.0
 _REPORT_KEYS = frozenset(("outcome", "summary", "files", "validation", "risks"))
@@ -70,10 +71,12 @@ class ForegroundCoder:
         *,
         settlement_timeout: float = _DEFAULT_SETTLEMENT_TIMEOUT,
         on_initialized: InitializationObserver | None = None,
+        on_result: ResultObserver | None = None,
     ) -> None:
         self._transport_factory = transport_factory
         self._settlement_timeout = settlement_timeout
         self._on_initialized = on_initialized
+        self._on_result = on_result
 
     async def run(self, contract: CoderContract) -> CoderResult:
         """Execute one contract and always close an initialized transport."""
@@ -153,6 +156,8 @@ class ForegroundCoder:
         async for event in messages:
             reducer.apply(event)
             if isinstance(event, ResultEvent):
+                if self._on_result is not None:
+                    self._on_result()
                 if not reducer.needs_settlement:
                     return reducer.finish(settlement_expired=False)
                 break

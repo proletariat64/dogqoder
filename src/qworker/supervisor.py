@@ -810,6 +810,12 @@ class Supervisor:
             )
             initialized = True
 
+        result_preceded_stop = False
+
+        def on_result() -> None:
+            nonlocal result_preceded_stop
+            result_preceded_stop = (worker_id, attempt) not in self._stop_requests
+
         result: WorkerResult
         try:
             if isinstance(contract, CoderContract):
@@ -817,12 +823,14 @@ class Supervisor:
                     owned_transport_factory,
                     settlement_timeout=self._settlement_timeout,
                     on_initialized=on_initialized,
+                    on_result=on_result,
                 ).run(contract)
             else:
                 result = await ForegroundAuditor(
                     owned_transport_factory,
                     settlement_timeout=self._settlement_timeout,
                     on_initialized=on_initialized,
+                    on_result=on_result,
                 ).run(contract)
         except asyncio.CancelledError:
             missing_state: Literal["cancelled", "lost"] = (
@@ -860,7 +868,13 @@ class Supervisor:
 
         result_key = (worker_id, attempt)
         result_phase = asyncio.create_task(
-            self._persist_accepted_result(worker_id, attempt, result, initialized),
+            self._persist_accepted_result(
+                worker_id,
+                attempt,
+                result,
+                initialized,
+                result_preceded_stop=result_preceded_stop,
+            ),
             name=f"qworker-result:{worker_id}",
         )
         self._result_phases[result_key] = result_phase
@@ -886,6 +900,8 @@ class Supervisor:
         attempt: int,
         result: WorkerResult,
         initialized: bool,
+        *,
+        result_preceded_stop: bool,
     ) -> None:
         """Durably commit an accepted result through its result-derived terminal state."""
 
@@ -914,7 +930,11 @@ class Supervisor:
                 "worker.warning",
                 {"schema_version": 1, "code": warning},
             )
-        terminal_state = "failed" if result.outcome == "failed" else "completed"
+        stop_key = (worker_id, attempt)
+        if stop_key in self._stop_requests and not result_preceded_stop:
+            terminal_state = "cancelled"
+        else:
+            terminal_state = "failed" if result.outcome == "failed" else "completed"
         if initialized:
             await self._append_event(
                 worker_id,
@@ -926,7 +946,7 @@ class Supervisor:
             "worker.state_changed",
             {"schema_version": 1, "state": terminal_state},
         )
-        self._stop_requests.discard((worker_id, attempt))
+        self._stop_requests.discard(stop_key)
 
     async def _append_event(
         self, worker_id: str, event_type: str, payload: dict[str, JsonValue]

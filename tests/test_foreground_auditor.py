@@ -190,6 +190,8 @@ async def test_foreground_auditor_renders_stable_prompt_envelope(
     assert "design.md is normative" in prompt
     assert "Report only evidenced findings." in prompt
     assert "Identify unsafe writes." in prompt
+    assert "Call mcp__qworker_audit__submit_audit exactly once" in prompt
+    assert "If that tool is unavailable" in prompt
     for destination in (
         "VERDICT",
         "CONFIRMED",

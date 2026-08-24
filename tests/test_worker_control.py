@@ -15,6 +15,7 @@ from qoder_agent_sdk import (
     ToolPermissionContext,
 )
 
+from qworker.audit_report import SUBMIT_AUDIT_TOOL, AuditReportCapture
 from qworker.cli import run
 from qworker.control import (
     ControlCallbacks,
@@ -891,6 +892,44 @@ async def test_sdk_adapter_bridges_callbacks_without_weakening_auditor_policy(
     assert await transport.cancel_message(message_id) is False
     assert client.steering == [("live steering prompt", "now", message_id)]
     assert client.cancelled == [message_id]
+
+
+async def test_host_report_submission_does_not_require_human_approval(
+    tmp_path: Path,
+) -> None:
+    options = build_auditor_options(
+        tmp_path,
+        report_capture=AuditReportCapture(),
+    )
+    transport = QoderSDKTransport(ControlFakeSDKClient(options))
+    permission_requests: list[PermissionRequest] = []
+
+    async def request_permission(request: PermissionRequest) -> PermissionDecision:
+        permission_requests.append(request)
+        return PermissionDecision("deny")
+
+    async def request_elicitation(
+        request: ElicitationRequest,
+    ) -> ElicitationDecision:
+        del request
+        return ElicitationDecision("cancel")
+
+    transport.bind_control(
+        ControlCallbacks(
+            request_permission=request_permission,
+            request_elicitation=request_elicitation,
+        )
+    )
+    assert options.can_use_tool is not None
+
+    decision = await options.can_use_tool(
+        SUBMIT_AUDIT_TOOL,
+        {},
+        ToolPermissionContext(agent_id=None),
+    )
+
+    assert isinstance(decision, PermissionResultAllow)
+    assert permission_requests == []
 
 
 async def test_cli_controls_live_worker_without_putting_bodies_in_argv(

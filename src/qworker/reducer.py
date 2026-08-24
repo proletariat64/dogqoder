@@ -1,9 +1,8 @@
 """Reduce normalized transport events into one auditor result."""
 
-import json
-from dataclasses import dataclass
-from typing import Literal, TypeGuard, cast
+from typing import Literal, cast
 
+from qworker.audit_report import AuditOutcome, parse_audit_report_text
 from qworker.domain import AuditFinding, AuditResult
 from qworker.events import (
     AdapterEvent,
@@ -17,36 +16,7 @@ from qworker.events import (
     TaskTerminalEvent,
 )
 
-type AuditOutcome = Literal["completed", "partial", "blocked", "failed"]
-_REPORT_OUTCOMES = frozenset(("completed", "partial", "blocked"))
-_REPORT_KEYS = frozenset(
-    (
-        "outcome",
-        "summary",
-        "files",
-        "validation",
-        "risks",
-        "verdict",
-        "confirmed",
-        "findings",
-        "required_changes",
-    )
-)
-_FINDING_KEYS = frozenset(("severity", "evidence", "affected_requirement_or_location"))
 _MAX_SEMANTIC_EVENTS = 128
-
-
-@dataclass(frozen=True, slots=True)
-class _ParsedAuditReport:
-    outcome: AuditOutcome
-    summary: str
-    files: tuple[str, ...]
-    validation: tuple[str, ...]
-    risks: tuple[str, ...]
-    verdict: str
-    confirmed: tuple[str, ...]
-    findings: tuple[AuditFinding, ...]
-    required_changes: tuple[str, ...]
 
 
 class ResultReducer:
@@ -111,7 +81,7 @@ class ResultReducer:
                 errors=("result_missing",),
             )
 
-        parsed_report = self._parse_report(result_event.result)
+        parsed_report = parse_audit_report_text(result_event.result)
         warnings: list[str] = []
         if parsed_report is None:
             outcome: AuditOutcome = "failed" if result_event.is_error else "partial"
@@ -194,92 +164,3 @@ class ResultReducer:
         if not self._active_task_ids:
             return "settled"
         return "unknown" if settlement_expired else "active"
-
-    def _parse_report(self, result_text: str | None) -> _ParsedAuditReport | None:
-        if result_text is None:
-            return None
-        normalized_text = self._normalize_report_json(result_text)
-        try:
-            payload: object = json.loads(normalized_text)
-        except json.JSONDecodeError:
-            return None
-        if not isinstance(payload, dict) or set(payload) != _REPORT_KEYS:
-            return None
-
-        outcome = payload.get("outcome")
-        summary = payload.get("summary")
-        files = payload.get("files")
-        validation = payload.get("validation")
-        risks = payload.get("risks")
-        verdict = payload.get("verdict")
-        confirmed = payload.get("confirmed")
-        findings = self._parse_findings(payload.get("findings"))
-        required_changes = payload.get("required_changes")
-        if (
-            not isinstance(outcome, str)
-            or outcome not in _REPORT_OUTCOMES
-            or not isinstance(summary, str)
-            or not self._is_string_list(files)
-            or not self._is_string_list(validation)
-            or not self._is_string_list(risks)
-            or not isinstance(verdict, str)
-            or not self._is_string_list(confirmed)
-            or findings is None
-            or not self._is_string_list(required_changes)
-        ):
-            return None
-
-        return _ParsedAuditReport(
-            outcome=cast(AuditOutcome, outcome),
-            summary=summary,
-            files=tuple(files),
-            validation=tuple(validation),
-            risks=tuple(risks),
-            verdict=verdict,
-            confirmed=tuple(confirmed),
-            findings=findings,
-            required_changes=tuple(required_changes),
-        )
-
-    @staticmethod
-    def _normalize_report_json(result_text: str) -> str:
-        candidate = result_text.strip()
-        fence_prefix = "```json\n"
-        fence_suffix = "\n```"
-        if (
-            candidate.startswith(fence_prefix)
-            and candidate.endswith(fence_suffix)
-            and candidate.count("```") == 2
-        ):
-            return candidate[len(fence_prefix) : -len(fence_suffix)]
-        return result_text
-
-    @staticmethod
-    def _parse_findings(value: object) -> tuple[AuditFinding, ...] | None:
-        if not isinstance(value, list):
-            return None
-        findings: list[AuditFinding] = []
-        for item in value:
-            if not isinstance(item, dict) or set(item) != _FINDING_KEYS:
-                return None
-            severity = item.get("severity")
-            evidence = item.get("evidence")
-            affected = item.get("affected_requirement_or_location")
-            if (
-                not isinstance(severity, str)
-                or not isinstance(evidence, str)
-                or (affected is not None and not isinstance(affected, str))
-            ):
-                return None
-            findings.append(
-                AuditFinding(
-                    severity=severity,
-                    evidence=evidence,
-                    affected_requirement_or_location=affected,
-                )
-            )
-        return tuple(findings)
-
-    @staticmethod
-    def _is_string_list(value: object) -> TypeGuard[list[str]]:
-        return isinstance(value, list) and all(isinstance(item, str) for item in value)

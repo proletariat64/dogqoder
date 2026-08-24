@@ -18,6 +18,7 @@ from qworker.transport import QoderTransport
 
 type TransportFactory = Callable[[Path], QoderTransport]
 type InitializationObserver = Callable[[str], Awaitable[None]]
+type ResultObserver = Callable[[], None]
 
 _DEFAULT_SETTLEMENT_TIMEOUT = 5.0
 
@@ -31,10 +32,12 @@ class ForegroundAuditor:
         *,
         settlement_timeout: float = _DEFAULT_SETTLEMENT_TIMEOUT,
         on_initialized: InitializationObserver | None = None,
+        on_result: ResultObserver | None = None,
     ) -> None:
         self._transport_factory = transport_factory
         self._settlement_timeout = settlement_timeout
         self._on_initialized = on_initialized
+        self._on_result = on_result
 
     async def run(self, contract: AuditContract) -> AuditResult:
         """Execute one contract and always close an initialized transport."""
@@ -114,6 +117,8 @@ class ForegroundAuditor:
         async for event in messages:
             reducer.apply(event)
             if isinstance(event, ResultEvent):
+                if self._on_result is not None:
+                    self._on_result()
                 if not reducer.needs_settlement:
                     return reducer.finish(settlement_expired=False)
                 break
@@ -161,7 +166,7 @@ def _render_prompt(contract: AuditContract) -> str:
         (
             "REPORT CONTRACT",
             (
-                "Return exactly one JSON object with keys outcome, summary, files, "
+                "Prepare exactly one object with keys outcome, summary, files, "
                 "validation, risks, verdict, confirmed, findings, and "
                 "required_changes. outcome must be completed, partial, or blocked; "
                 "summary and verdict are strings; files, validation, risks, "
@@ -171,6 +176,10 @@ def _render_prompt(contract: AuditContract) -> str:
                 "the last is a string or null. Use these audit destinations: "
                 "VERDICT -> verdict; CONFIRMED -> confirmed; FINDINGS -> findings; "
                 "RISKS -> risks; REQUIRED_CHANGES -> required_changes."
+                " Call mcp__qworker_audit__submit_audit exactly once with that "
+                "object and do not repeat the report as prose. If that tool is "
+                "unavailable, return the object as exact JSON with no surrounding "
+                "text."
             ),
         ),
     )

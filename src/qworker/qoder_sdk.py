@@ -14,7 +14,7 @@ from collections.abc import (
     Mapping,
     Sequence,
 )
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib.metadata import version
 from importlib.resources import files
 from pathlib import Path
@@ -47,8 +47,10 @@ from qoder_agent_sdk import (
     ToolPermissionContext,
     ToolUseBlock,
     access_token_from_env,
+    create_sdk_mcp_server,
     qodercli_auth,
     service_account_from_env,
+    tool,
 )
 from qoder_agent_sdk import (
     ElicitationRequest as SDKElicitationRequest,
@@ -58,6 +60,13 @@ from qoder_agent_sdk import (
 )
 from qoder_agent_sdk.types import ToolsPreset
 
+from qworker.audit_report import (
+    AUDIT_REPORT_MCP_SERVER,
+    AUDIT_REPORT_SCHEMA,
+    SUBMIT_AUDIT_TOOL,
+    SUBMIT_AUDIT_TOOL_NAME,
+    AuditReportCapture,
+)
 from qworker.auditor_policy import AuditorToolPolicy
 from qworker.config import ConfigError, load_config
 from qworker.control import (
@@ -123,6 +132,7 @@ def build_auditor_options(
     auth: AuthOptions | None = None,
     cli_path: Path | None = None,
     resume: str | None = None,
+    report_capture: AuditReportCapture | None = None,
 ) -> QoderAgentOptions:
     """Build isolated SDK options enforcing the auditor tool policy."""
 
@@ -144,14 +154,42 @@ def build_auditor_options(
             return PermissionResultAllow(updated_input=tool_input)
         return PermissionResultDeny(message=decision.reason)
 
+    visible_tools = list(policy.visible_tools)
+    mcp_servers: dict[str, Any] = {}
+    allowed_mcp_server_names: list[str] = []
+    if report_capture is not None:
+
+        @tool(
+            SUBMIT_AUDIT_TOOL_NAME,
+            "Submit the final structured auditor report to the qworker host.",
+            AUDIT_REPORT_SCHEMA,
+        )
+        async def submit_audit(arguments: dict[str, Any]) -> dict[str, Any]:
+            if not report_capture.record(arguments):
+                return {
+                    "content": [{"type": "text", "text": "Audit report was rejected."}],
+                    "is_error": True,
+                }
+            return {"content": [{"type": "text", "text": "Audit report accepted."}]}
+
+        mcp_servers[AUDIT_REPORT_MCP_SERVER] = create_sdk_mcp_server(
+            AUDIT_REPORT_MCP_SERVER,
+            tools=[submit_audit],
+        )
+        allowed_mcp_server_names.append(AUDIT_REPORT_MCP_SERVER)
+        visible_tools.append(SUBMIT_AUDIT_TOOL)
+
     return QoderAgentOptions(
         auth=auth,
         cwd=cwd,
         cli_path=cli_path,
         resume=resume,
         setting_sources=[],
-        tools=list(policy.visible_tools),
+        tools=visible_tools,
         allowed_tools=list(policy.visible_tools),
+        mcp_servers=mcp_servers,
+        allowed_mcp_server_names=allowed_mcp_server_names,
+        strict_mcp_config=report_capture is not None,
         disallowed_tools=list(policy.denied_tools),
         permission_mode="dontAsk",
         max_turns=24,
@@ -200,8 +238,15 @@ def build_coder_options(
 def create_default_transport(cwd: Path) -> "QoderSDKTransport":
     """Create production transport from the same config/auth policy as preflight."""
 
-    options = build_configured_auditor_options(cwd)
-    return QoderSDKTransport(QoderSDKClient(options=options))
+    report_capture = AuditReportCapture()
+    options = build_configured_auditor_options(
+        cwd,
+        report_capture=report_capture,
+    )
+    return QoderSDKTransport(
+        QoderSDKClient(options=options),
+        report_capture=report_capture,
+    )
 
 
 def create_coder_transport(cwd: Path) -> "QoderSDKTransport":
@@ -214,8 +259,16 @@ def create_coder_transport(cwd: Path) -> "QoderSDKTransport":
 def create_resumed_transport(cwd: Path, session_id: str) -> "QoderSDKTransport":
     """Create a fresh production transport resumed from stored conversation history."""
 
-    options = build_configured_auditor_options(cwd, resume=session_id)
-    return QoderSDKTransport(QoderSDKClient(options=options))
+    report_capture = AuditReportCapture()
+    options = build_configured_auditor_options(
+        cwd,
+        resume=session_id,
+        report_capture=report_capture,
+    )
+    return QoderSDKTransport(
+        QoderSDKClient(options=options),
+        report_capture=report_capture,
+    )
 
 
 def create_resumed_coder_transport(
@@ -234,6 +287,7 @@ def build_configured_auditor_options(
     user_path: Path | None = None,
     environ: Mapping[str, str] | None = None,
     resume: str | None = None,
+    report_capture: AuditReportCapture | None = None,
 ) -> QoderAgentOptions:
     """Build worker options from validated config without reading credential values."""
 
@@ -272,6 +326,7 @@ def build_configured_auditor_options(
         auth=_sdk_auth(auth),
         cli_path=runtime_path,
         resume=resume,
+        report_capture=report_capture,
     )
 
 
@@ -600,8 +655,14 @@ class _PinnedSDKSubprocessTransport(Protocol):
 class QoderSDKTransport:
     """Adapt one injected SDK client to the stable worker transport seam."""
 
-    def __init__(self, client: object) -> None:
+    def __init__(
+        self,
+        client: object,
+        *,
+        report_capture: AuditReportCapture | None = None,
+    ) -> None:
         self._client = cast(_SDKClient, client)
+        self._report_capture = report_capture
         self._credential_values = _direct_credential_values(client)
         self._model_identifiers: dict[str, str] = {}
         self._control_callbacks: ControlCallbacks | None = None
@@ -689,6 +750,8 @@ class QoderSDKTransport:
                     message="Tool permission policy failed closed."
                 )
             if isinstance(policy_decision, PermissionResultDeny):
+                return policy_decision
+            if tool_name == SUBMIT_AUDIT_TOOL:
                 return policy_decision
             display_message = (
                 context.title
@@ -778,6 +841,19 @@ class QoderSDKTransport:
             async for message in self._client.receive_messages():
                 event = _map_sdk_message(message, self._credential_values)
                 if event is not None:
+                    submitted_report = (
+                        self._report_capture.report_text
+                        if self._report_capture is not None
+                        else None
+                    )
+                    if isinstance(event, ResultEvent) and submitted_report is not None:
+                        event = replace(
+                            event,
+                            result=_redact_json_text(
+                                submitted_report,
+                                self._credential_values,
+                            ),
+                        )
                     yield event
         except ProcessError:
             raise EOFError("QoderCLI process exited.") from None
@@ -1026,6 +1102,35 @@ def _redact(value: str, credential_values: tuple[str, ...] = ()) -> str:
         if environment_secret:
             safe = safe.replace(environment_secret, "[REDACTED]")
     return safe
+
+
+def _redact_json_text(value: str, credential_values: tuple[str, ...]) -> str:
+    """Redact decoded JSON strings so escaped credentials cannot cross the seam."""
+
+    try:
+        payload: object = json.loads(value)
+    except json.JSONDecodeError:
+        return _redact(value, credential_values)
+    safe_payload = _redact_json_value(payload, credential_values)
+    return json.dumps(
+        safe_payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def _redact_json_value(value: object, credential_values: tuple[str, ...]) -> object:
+    if isinstance(value, str):
+        return _redact(value, credential_values)
+    if isinstance(value, list):
+        return [_redact_json_value(item, credential_values) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _redact_json_value(item, credential_values)
+            for key, item in value.items()
+        }
+    return value
 
 
 def _direct_credential_values(client: object) -> tuple[str, ...]:

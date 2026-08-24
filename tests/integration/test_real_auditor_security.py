@@ -565,10 +565,10 @@ async def test_real_coder_completes_host_verified_edit_ac5(
 
 
 @pytest.mark.real_qoder
-async def test_real_auditor_and_direct_helper_denials_ac6(
+async def test_real_auditor_containment_ac6(
     tmp_path: Path,
 ) -> None:
-    """Observe real top-level and direct-helper mutation denials safely."""
+    """Combine deterministic host enforcement with live auditor containment."""
 
     require_real_qoder_credentials()
     credential = os.environ["QODER_PERSONAL_ACCESS_TOKEN"]
@@ -627,17 +627,14 @@ async def test_real_auditor_and_direct_helper_denials_ac6(
                 forbidden=credential,
                 timeout=10,
             )
-        evidence = probe.evidence()
-        evidence.update(
-            {
-                "workspace_unchanged": _workspace_snapshot(workspace) == before,
-                "result_completed": result.get("outcome") == "completed",
-                "credential_absent": credential
-                not in json.dumps((events, result), sort_keys=True),
-            }
-        )
-        if not all(evidence.values()):
-            _fail_with_safe_evidence("AC6 live evidence:", evidence)
+        required_evidence = {
+            "workspace_unchanged": _workspace_snapshot(workspace) == before,
+            "result_completed": result.get("outcome") == "completed",
+            "credential_absent": credential
+            not in json.dumps((events, result), sort_keys=True),
+        }
+        if not all(required_evidence.values()):
+            _fail_with_safe_evidence("AC6 live containment:", required_evidence)
     finally:
         if approval_task is not None and not approval_task.done():
             approval_task.cancel()
