@@ -522,6 +522,8 @@ async def test_schema_display_never_persists_sensitive_property_names(
     aws_shaped_name = "AKIA1234567890ABCDEF"
     jwt_shaped_name = "abcd.efgh.ijkl"
     marker_name = "password"
+    token_name = "token"
+    refresh_token_name = "refresh_token"
     elicitation = asyncio.create_task(
         callbacks.request_elicitation(
             ElicitationRequest(
@@ -535,6 +537,8 @@ async def test_schema_display_never_persists_sensitive_property_names(
                         aws_shaped_name: {"type": "string"},
                         jwt_shaped_name: {"type": "string"},
                         marker_name: {"type": "string"},
+                        token_name: {"type": "string"},
+                        refresh_token_name: {"type": "string"},
                     },
                 },
             )
@@ -561,7 +565,13 @@ async def test_schema_display_never_persists_sensitive_property_names(
     assert requested.payload["fields"] == ["region:string"]
     with sqlite3.connect(store.database_path) as connection:
         durable = json.dumps(connection.execute("SELECT * FROM events").fetchall())
-    for sensitive_name in (aws_shaped_name, jwt_shaped_name, marker_name):
+    for sensitive_name in (
+        aws_shaped_name,
+        jwt_shaped_name,
+        marker_name,
+        token_name,
+        refresh_token_name,
+    ):
         assert sensitive_name not in durable
 
     await supervisor.respond(worker_id, request_id, {"action": "cancel"})

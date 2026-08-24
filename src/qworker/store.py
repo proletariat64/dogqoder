@@ -150,8 +150,12 @@ _METADATA = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _VERSION = re.compile(
     r"v?\d+(?:\.\d+){1,3}(?:[-+][A-Za-z0-9._-]{1,64})?\Z", re.IGNORECASE
 )
+_CREDENTIAL_KEY_PATTERN = (
+    r"(?:api[_ -]?key|token|secret|credential|password|authorization|"
+    r"private[_ -]?key|service[_ -]?account[_ -]?key)"
+)
 _CREDENTIAL_MARKER = re.compile(
-    r"(?:^sk[-_]|^pk[-_]|^bearer[._ -]|api[_-]?key|access[_-]?token|secret|credential|password|authorization)",
+    rf"(?:^sk[-_]|^pk[-_]|^bearer[._ -]|{_CREDENTIAL_KEY_PATTERN})",
     re.IGNORECASE,
 )
 _JWT = re.compile(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\Z")
@@ -170,11 +174,7 @@ _KEYED_CREDENTIAL = re.compile(
     r"authorization)\b(?:\s*[:=]\s*|\s+)[^\s,;]+",
     re.IGNORECASE,
 )
-_RESULT_CREDENTIAL_KEY = re.compile(
-    r"(?:api[_ -]?key|token|secret|credential|password|authorization|"
-    r"private[_ -]?key|service[_ -]?account[_ -]?key)",
-    re.IGNORECASE,
-)
+_RESULT_CREDENTIAL_KEY = re.compile(_CREDENTIAL_KEY_PATTERN, re.IGNORECASE)
 
 
 @dataclass(slots=True)
