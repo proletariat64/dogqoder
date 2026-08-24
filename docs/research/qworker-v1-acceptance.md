@@ -1,14 +1,15 @@
 # qworker V1 acceptance evidence
 
 Date: 2026-08-24
+Updated: 2026-08-25
 
 ## Verdict
 
 V1 is **not yet fully accepted**. Credential-free public-interface coverage now
 demonstrates most lifecycle, control, persistence, recovery, and security
-contracts. The three authorized one-shot closing markers, plus one later
-diagnosis-driven AC5 rerun, produced useful but non-passing evidence for criteria
-5, 6, and 11, so those criteria remain partial.
+contracts. After separating verified work from optional model-authored JSON,
+criterion 5 is live-confirmed by one later authorized marker. Criteria 6 and 11
+remain partial.
 Acceptance criterion 7 is **Waived — QoderCLI limitation** by explicit user
 decision; a waiver records the unsupported boundary and is not a demonstration.
 
@@ -57,7 +58,7 @@ Status meanings:
 | 2 | Demonstrated | Same test uses fresh CLI processes for `status`, `watch`, `steer`, `cancel-message`, `respond`, and `result` while one supervisor owns both attempts. |
 | 3 | Demonstrated | Same test replays from zero, reconnects with the last cursor, follows to terminal state, and asserts contiguous per-worker sequences without cross-worker events. |
 | 4 | Live-confirmed | The deterministic lifecycle test proves requested `qwen-auditor`, resolved `Qwen3.8-Max`, and actual `Qwen3.8-Max` fields at the public result boundary. The authorized live rerun confirmed accepted/starting/running/result/completed lifecycle, no requires-action/lost/failed state, bundled runtime selection, and resolved plus actual `Qwen3.8-Max` reporting. |
-| 5 | Partial | Public deterministic coverage now recovers an exact five-key report from the latest assistant event when the terminal SDK result is unparseable. Both the initial marker and the one explicitly authorized post-fix rerun created the exact requested file in a disposable non-worktree and reported resolved/actual `Qwen3.8-Max`; both still lacked completed outcome, file report, and nonempty validation. The fallback therefore did not close the live criterion. |
+| 5 | Live-confirmed | The public replay now separates worker lifecycle and host-verified workspace facts from the optional model report: a non-error result may remain `partial` with `report_contract_unparseable` while the worker reaches `completed`. One authorized live marker then confirmed result receipt, completed lifecycle, exact marker bytes, disposable non-worktree isolation, resolved/actual `Qwen3.8-Max`, and credential exclusion. Model-authored JSON, reported files, and self-reported validation are no longer evidence gates for whether the coder performed the requested work. |
 | 6 | Partial | Deterministic callback tests deny top-level and nested Write/Edit/Bash requests and prove the safe probe discards inputs and agent IDs. In the one authorized adversarial live marker, the workspace remained byte-identical and credential-free, but QoderCLI emitted none of the requested top-level or helper permission callbacks, including no top-level Agent request, and the structured result did not complete. The live denial boundary is therefore unproven. |
 | 7 | Waived — QoderCLI limitation | Adapter fixtures can normalize task messages, but the installed live QoderCLI/SDK path did not provide a trustworthy public correlation from worker task telemetry to post-run direct-helper discovery. The SDK's transcript readers are standalone local functions keyed by a session UUID; qworker's public result intentionally does not expose that locator or persist direct-helper task events. Context7 returned cloud-session material rather than a supported local worker correlation flow. The user explicitly waived AC7; it is not accepted as demonstrated. |
 | 8 | Demonstrated | The lifecycle test emits task start/progress without terminal telemetry. Both public results finish with `nested_state=unknown` and warning `nested_terminal_event_missing`; neither worker stays running. |
@@ -106,6 +107,16 @@ uv run mypy src tests
 
 git diff --check
 # clean
+```
+
+The 2026-08-25 AC5 evidence change then passed the two focused public tests,
+Ruff, full mypy, scoped formatting, and `git diff --check`. A parallel full
+suite run hit the same unrelated one-second large-RPC timeout; that node passed
+alone, and the serial confirmation was clean:
+
+```bash
+uv run pytest -m 'not real_qoder' -q
+# 263 passed, 7 deselected in 25.26s
 ```
 
 ## Bounded real-Qoder marker UAT
@@ -225,6 +236,40 @@ rules out “exact contract existed in a prior assistant event” for this run; 
 does not reveal or retain the prompt, marker, session, transcript, or response.
 No AC6, AC11, earlier UAT, or other real test ran in this diagnosis phase.
 
+### AC5 verified-work reclassification and authorized one-shot
+
+On 2026-08-25 the user explicitly changed AC5's success definition: objective
+evidence that the worker performed the requested edit is authoritative;
+model-authored JSON is optional reporting. qworker's structured result remains
+unchanged and still exposes `report_contract_unparseable` when appropriate.
+
+The credential-free public CLI replay first failed after removing the synthetic
+assistant report. Its safe evidence showed exact marker bytes, expected model,
+and non-worktree isolation as `true`; only the three report-derived gates were
+`false`. The revised replay then passed with a deliberately partial result and
+the warning preserved:
+
+```bash
+uv run pytest tests/integration/test_real_auditor_security.py::test_coder_work_evidence_uses_lifecycle_and_host_validation tests/integration/test_real_auditor_security.py::test_ac5_replay_accepts_verified_edit_without_report_contract -q
+# 2 passed in 1.65s
+```
+
+After the complete credential-free suite passed, exactly one revised real AC5
+marker ran:
+
+```bash
+timeout 210s uv run pytest -m real_qoder tests/integration/test_real_auditor_security.py::test_real_coder_completes_host_verified_edit_ac5 -q
+# 1 passed in 34.05s
+```
+
+The fixed-boolean gates confirm a public result event, worker lifecycle
+`completed`, exact marker bytes, no `.git` directory, resolved and actual
+`Qwen3.8-Max`, and credential exclusion. The host's exact-byte check is the
+validation authority. The test neither requires nor exposes model-authored
+JSON, reported files, self-reported validation, prompt, marker, session, or
+response text. No other real node ran, and this marker was not retried. AC5 is
+therefore **Live-confirmed** under the revised evidence definition.
+
 ```bash
 timeout 210s uv run pytest -m real_qoder tests/integration/test_real_auditor_security.py::test_real_auditor_and_direct_helper_denials_ac6 -q
 # 1 failed in 91.35s
@@ -252,15 +297,15 @@ retried.
 
 ## Remaining acceptance work
 
-1. Determine why the real coder completes its exact edit without placing an
-   exact contract in either the terminal result or assistant-event fallback; a
-   future live retry needs fresh explicit authorization.
-2. Determine why the installed QoderCLI does not issue the exposed adversarial
+1. Determine why the installed QoderCLI does not issue the exposed adversarial
    Write/Edit/Bash or Agent callbacks; a future live retry needs fresh explicit
    authorization.
-3. Determine why the live non-forced stop returned a terminal state other than
+2. Determine why the live non-forced stop returned a terminal state other than
    `cancelled` despite exited health and owned-child disappearance; a future live
    retry needs fresh explicit authorization.
-4. Revisit AC7 only if a later QoderCLI/SDK boundary supplies correlatable live
+3. Revisit AC7 only if a later QoderCLI/SDK boundary supplies correlatable live
    direct-helper telemetry and transcript discovery; its current waiver is not
    acceptance evidence.
+4. Decide whether auditor correctness should continue to require strict
+   model-authored JSON or instead use independently observed read-only evidence
+   plus optional reporting, without weakening finding/verdict semantics.

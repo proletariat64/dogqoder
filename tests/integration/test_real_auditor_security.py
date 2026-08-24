@@ -19,7 +19,7 @@ from qoder_agent_sdk import (
 )
 from qoder_agent_sdk.types import ToolPermissionContext
 
-from qworker.events import AdapterEvent, AssistantEvent, ResultEvent
+from qworker.events import AdapterEvent, ResultEvent
 from qworker.model_policy import AvailableModel
 from qworker.preflight import RuntimePreflight
 from qworker.qoder_sdk import (
@@ -37,18 +37,6 @@ from tests.fakes import FakeQoderTransport
 from tests.real_qoder import require_real_qoder_credentials
 
 _CLI_BOOTSTRAP = "from qworker.cli import main; raise SystemExit(main())"
-
-
-def _valid_coder_report() -> str:
-    return json.dumps(
-        {
-            "outcome": "completed",
-            "summary": "synthetic edit completed",
-            "files": ["marker.txt"],
-            "validation": ["marker bytes verified"],
-            "risks": [],
-        }
-    )
 
 
 class _EditingCoderTransport(FakeQoderTransport):
@@ -95,11 +83,6 @@ class _IncompleteCoderReportTransport(FakeQoderTransport):
         super().__init__(
             models=(AvailableModel(value="Qwen3.8-Max", enabled=True),),
             events=(
-                AssistantEvent(
-                    text=(_valid_coder_report(),),
-                    tools=(),
-                    model="Qwen3.8-Max",
-                ),
                 ResultEvent(
                     session_id="synthetic-ac5-session",
                     is_error=False,
@@ -185,10 +168,11 @@ async def _one_cli_frame(
 
 
 def _safe_coder_evidence(
-    result: dict[str, object], workspace: Path, marker: str
+    events: Sequence[dict[str, object]],
+    result: dict[str, object],
+    workspace: Path,
+    marker: str,
 ) -> dict[str, bool]:
-    files = result.get("files")
-    validation = result.get("validation")
     actual_models = result.get("actual_models")
     marker_path = workspace / "marker.txt"
     try:
@@ -196,10 +180,15 @@ def _safe_coder_evidence(
     except OSError:
         marker_exact = False
     return {
-        "result_completed": result.get("outcome") == "completed",
+        "result_received": bool(result)
+        and any(frame.get("type") == "result.received" for frame in events),
+        "worker_completed": any(
+            frame.get("type") == "worker.state_changed"
+            and isinstance(frame.get("payload"), dict)
+            and cast(dict[str, object], frame["payload"]).get("state") == "completed"
+            for frame in events
+        ),
         "marker_exact": marker_exact,
-        "reported_marker_file": isinstance(files, list) and "marker.txt" in files,
-        "structured_validation": isinstance(validation, list) and bool(validation),
         "resolved_qwen_max": result.get("resolved_model") == "Qwen3.8-Max",
         "actual_qwen_max": isinstance(actual_models, list)
         and "Qwen3.8-Max" in actual_models,
@@ -388,25 +377,28 @@ async def test_adversarial_probe_retains_only_fixed_denial_categories(
     assert _workspace_snapshot(tmp_path) == before
 
 
-def test_coder_evidence_reduces_result_and_workspace_to_fixed_booleans(
+def test_coder_work_evidence_uses_lifecycle_and_host_validation(
     tmp_path: Path,
 ) -> None:
-    """Regress safe AC5 reporting without retaining a live result or marker."""
+    """Regress safe AC5 work evidence without requiring a model report."""
 
     marker = "deterministic-marker"
     (tmp_path / "marker.txt").write_text(f"{marker}\n", encoding="utf-8")
+    events: list[dict[str, object]] = [
+        {"type": "result.received", "payload": {}},
+        {"type": "worker.state_changed", "payload": {"state": "completed"}},
+    ]
     result: dict[str, object] = {
-        "outcome": "completed",
-        "files": ["marker.txt"],
-        "validation": ["exact bytes"],
+        "outcome": "partial",
         "resolved_model": "Qwen3.8-Max",
         "actual_models": ["Qwen3.8-Max"],
+        "warnings": ["report_contract_unparseable"],
     }
 
-    assert all(_safe_coder_evidence(result, tmp_path, marker).values())
+    assert all(_safe_coder_evidence(events, result, tmp_path, marker).values())
 
 
-async def test_ac5_replay_requires_contract_after_successful_coder_edit(
+async def test_ac5_replay_accepts_verified_edit_without_report_contract(
     tmp_path: Path,
 ) -> None:
     """Replay the live AC5 edit/result split without credentials or network."""
@@ -430,13 +422,17 @@ async def test_ac5_replay_requires_contract_after_successful_coder_edit(
             stdin="write the synthetic marker",
         )
         worker_id = str(accepted["worker_id"])
-        await _run_cli(
+        events = await _run_cli(
             socket_path,
             ("watch", worker_id, "--since", "0", "--follow", "--json"),
         )
         result = await _one_cli_frame(socket_path, ("result", worker_id, "--json"))
 
-        evidence = _safe_coder_evidence(result, workspace, "synthetic-marker")
+        assert result.get("outcome") == "partial"
+        warnings = result.get("warnings")
+        assert isinstance(warnings, list)
+        assert "report_contract_unparseable" in warnings
+        evidence = _safe_coder_evidence(events, result, workspace, "synthetic-marker")
         if not all(evidence.values()):
             _fail_with_safe_evidence("AC5 deterministic replay:", evidence)
     finally:
@@ -511,10 +507,10 @@ async def test_public_coder_edits_disposable_workspace_without_leaking_credentia
 
 
 @pytest.mark.real_qoder
-async def test_real_coder_edit_and_structured_validation_ac5(
+async def test_real_coder_completes_host_verified_edit_ac5(
     tmp_path: Path,
 ) -> None:
-    """Run one bounded real coder against an isolated non-worktree workspace."""
+    """Verify real coder work independently of its optional final report."""
 
     require_real_qoder_credentials()
     credential = os.environ["QODER_PERSONAL_ACCESS_TOKEN"]
@@ -539,8 +535,7 @@ async def test_real_coder_edit_and_structured_validation_ac5(
                 ("spawn", "--role", "coder", "--cwd", str(workspace), "--json"),
                 stdin=(
                     "Create marker.txt containing exactly the following marker and one "
-                    f"trailing newline: {marker}. Validate the exact bytes, then return "
-                    "the required structured coder report naming marker.txt."
+                    f"trailing newline: {marker}. Validate the exact bytes."
                 ),
                 forbidden=credential,
                 timeout=45,
@@ -558,7 +553,7 @@ async def test_real_coder_edit_and_structured_validation_ac5(
                 forbidden=credential,
                 timeout=10,
             )
-        evidence = _safe_coder_evidence(result, workspace, marker)
+        evidence = _safe_coder_evidence(events, result, workspace, marker)
         evidence["credential_absent"] = credential not in json.dumps(
             (events, result), sort_keys=True
         )
