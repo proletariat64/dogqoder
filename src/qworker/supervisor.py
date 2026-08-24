@@ -3,9 +3,10 @@
 import asyncio
 import uuid
 from collections.abc import AsyncIterator, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 from qworker.auditor import ForegroundAuditor, TransportFactory
 from qworker.control import (
@@ -31,6 +32,7 @@ from qworker.transport import QoderTransport
 
 _TERMINAL_STATES = frozenset(("completed", "failed", "cancelled", "lost"))
 _STEERING_PRIORITIES = frozenset(("now", "next", "later"))
+_MAX_STOP_TIMEOUT = 10.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -60,15 +62,20 @@ class Supervisor:
         runtime_path: str = "bundled",
         runtime_version: str | None = None,
         settlement_timeout: float = 5.0,
+        stop_timeout: float = _MAX_STOP_TIMEOUT,
     ) -> None:
+        if stop_timeout < 0:
+            raise ValueError("stop_timeout must be non-negative.")
         self._store = store
         self._transport_factory = transport_factory
         self._sdk_version = sdk_version
         self._runtime_path = runtime_path
         self._runtime_version = runtime_version
         self._settlement_timeout = settlement_timeout
+        self._stop_timeout = min(stop_timeout, _MAX_STOP_TIMEOUT)
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._live_attempts: dict[str, _LiveAttempt] = {}
+        self._stop_requests: set[tuple[str, int]] = set()
         self._pending_approvals: dict[str, PendingApproval] = {}
         self._control_lock = asyncio.Lock()
         self._event_conditions: dict[str, asyncio.Condition] = {}
@@ -203,6 +210,79 @@ class Supervisor:
         )
         return {"message_id": message_id, "cancelled": cancelled}
 
+    async def stop(
+        self,
+        worker_id: str,
+        *,
+        force: bool = False,
+        agent_id: str | None = None,
+    ) -> dict[str, JsonValue]:
+        """Stop one top-level attempt without changing its workspace."""
+
+        if agent_id is not None:
+            raise SupervisorError(
+                "unsupported_operation",
+                "Selected nested-agent stop is not supported.",
+            )
+        async with self._control_lock:
+            worker = await self._require_worker(worker_id)
+            if worker.state in _TERMINAL_STATES:
+                cursor = await self._store.latest_event_cursor(worker_id)
+                response = _worker_json(worker, event_cursor=cursor)
+                response["pending_approvals"] = []
+                response["force"] = force
+                return response
+            task = self._tasks.get(worker_id)
+            if task is None:
+                raise SupervisorError("worker_not_live", "Worker has no live attempt.")
+            attempt = worker.attempt
+            self._stop_requests.add((worker_id, attempt))
+            live = self._live_attempts.get(worker_id)
+            if live is not None and live.attempt != attempt:
+                live = None
+
+        if live is None and not force:
+            await asyncio.sleep(0)
+            current = self._live_attempts.get(worker_id)
+            if current is not None and current.attempt == attempt:
+                live = current
+
+        terminate = force
+        if not force and live is not None:
+            deadline = asyncio.get_running_loop().time() + self._stop_timeout
+            try:
+                async with asyncio.timeout_at(deadline):
+                    await live.transport.interrupt()
+            except Exception:  # noqa: BLE001 -- close after any interrupt failure
+                terminate = True
+            if not terminate:
+                remaining = max(
+                    0.0,
+                    deadline - asyncio.get_running_loop().time(),
+                )
+                done, _pending = await asyncio.wait((task,), timeout=remaining)
+                terminate = not done
+        elif not force:
+            terminate = True
+
+        if terminate:
+            if live is not None:
+                with suppress(Exception):
+                    await live.transport.disconnect()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+        await self._finalize_without_result(
+            worker_id,
+            attempt,
+            missing_state="cancelled",
+        )
+        self._stop_requests.discard((worker_id, attempt))
+        status = await self.status(worker_id)
+        status["force"] = force
+        return status
+
     async def respond(
         self,
         worker_id: str,
@@ -308,9 +388,13 @@ class Supervisor:
         """Cancel live worker tasks and close supervisor-owned durable state."""
 
         self._closed = True
+        for worker_id in tuple(self._tasks):
+            with suppress(SupervisorError):
+                await self.stop(worker_id, force=True)
         tasks = tuple(self._tasks.values())
         for task in tasks:
-            task.cancel()
+            if not task.done():
+                task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._tasks.clear()
@@ -379,12 +463,41 @@ class Supervisor:
         try:
             result = await auditor.run(contract)
         except asyncio.CancelledError:
-            await self._detach_live_attempt(worker_id, attempt)
+            missing_state: Literal["cancelled", "lost"] = (
+                "cancelled"
+                if (worker_id, attempt) in self._stop_requests
+                else "lost"
+            )
+            await self._finalize_without_result(
+                worker_id,
+                attempt,
+                missing_state=missing_state,
+            )
             raise
+        except (BrokenPipeError, ConnectionResetError, EOFError):
+            await self._finalize_without_result(
+                worker_id,
+                attempt,
+                missing_state="lost",
+            )
+            return
         except Exception:  # noqa: BLE001 -- isolate an arbitrary transport failure
             result = _execution_failure(contract)
 
         await self._complete_live_attempt(worker_id, attempt)
+
+        if "result_missing" in result.errors:
+            missing_state = (
+                "cancelled"
+                if (worker_id, attempt) in self._stop_requests
+                else "lost"
+            )
+            await self._finalize_without_result(
+                worker_id,
+                attempt,
+                missing_state=missing_state,
+            )
+            return
 
         await self._store.record_result(
             worker_id,
@@ -415,6 +528,7 @@ class Supervisor:
             "worker.state_changed",
             {"schema_version": 1, "state": terminal_state},
         )
+        self._stop_requests.discard((worker_id, attempt))
 
     async def _append_event(
         self, worker_id: str, event_type: str, payload: dict[str, JsonValue]
@@ -568,6 +682,40 @@ class Supervisor:
                         )
                         item.future.set_result(decision)
             self._live_attempts.pop(worker_id, None)
+
+    async def _finalize_without_result(
+        self,
+        worker_id: str,
+        attempt: int,
+        *,
+        missing_state: Literal["cancelled", "lost"],
+    ) -> None:
+        """Close attempt controls, then preserve a result or classify its absence."""
+
+        await self._complete_live_attempt(worker_id, attempt)
+        worker = await self._require_worker(worker_id)
+        if worker.attempt != attempt or worker.state in _TERMINAL_STATES:
+            return
+        target: Literal["completed", "failed", "cancelled", "lost"] = missing_state
+        if worker.result_summary is not None:
+            target = (
+                "failed"
+                if worker.result_summary.get("outcome") == "failed"
+                else "completed"
+            )
+        if worker.health != "exited":
+            await self._append_event(
+                worker_id,
+                "worker.health_changed",
+                {"schema_version": 1, "health": "exited"},
+            )
+        current = await self._require_worker(worker_id)
+        if current.attempt == attempt and current.state not in _TERMINAL_STATES:
+            await self._append_event(
+                worker_id,
+                "worker.state_changed",
+                {"schema_version": 1, "state": target},
+            )
 
     def _task_finished(self, worker_id: str, completed: asyncio.Task[None]) -> None:
         self._tasks.pop(worker_id, None)

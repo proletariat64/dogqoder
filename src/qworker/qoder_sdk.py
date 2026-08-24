@@ -1,5 +1,6 @@
 """Qoder Agent SDK 1.0.13 adapter."""
 
+import asyncio
 import json
 import os
 from collections.abc import (
@@ -24,6 +25,7 @@ from qoder_agent_sdk import (
     CLINotFoundError,
     PermissionResultAllow,
     PermissionResultDeny,
+    ProcessError,
     QoderAgentOptions,
     QoderCLIAuthOptions,
     QoderSDKClient,
@@ -153,6 +155,7 @@ type SDKOperation = Literal[
     "query",
     "steer",
     "cancel_message",
+    "interrupt",
     "stream",
     "disconnect",
 ]
@@ -211,6 +214,8 @@ class _SDKClient(Protocol):
 
     async def cancel_async_message(self, message_uuid: str) -> bool: ...
 
+    async def interrupt(self) -> None: ...
+
     def receive_messages(self) -> AsyncIterator[object]: ...
 
     async def disconnect(self) -> None: ...
@@ -224,6 +229,8 @@ class QoderSDKTransport:
         self._credential_values = _direct_credential_values(client)
         self._model_identifiers: dict[str, str] = {}
         self._control_callbacks: ControlCallbacks | None = None
+        self._disconnect_lock = asyncio.Lock()
+        self._disconnected = False
 
     async def connect(self) -> None:
         await _call_sdk(
@@ -378,12 +385,21 @@ class QoderSDKTransport:
             credential_values=self._credential_values,
         )
 
+    async def interrupt(self) -> None:
+        await _call_sdk(
+            self._client.interrupt,
+            operation="interrupt",
+            credential_values=self._credential_values,
+        )
+
     async def messages(self) -> AsyncIterator[AdapterEvent]:
         try:
             async for message in self._client.receive_messages():
                 event = _map_sdk_message(message, self._credential_values)
                 if event is not None:
                     yield event
+        except ProcessError:
+            raise EOFError("QoderCLI process exited.") from None
         # SDK 1.0.13 raises plain Exception for initialize control timeouts.
         except Exception as error:  # noqa: BLE001
             diagnostic = classify_sdk_error(
@@ -396,11 +412,15 @@ class QoderSDKTransport:
         raise diagnostic
 
     async def disconnect(self) -> None:
-        await _call_sdk(
-            self._client.disconnect,
-            operation="disconnect",
-            credential_values=self._credential_values,
-        )
+        async with self._disconnect_lock:
+            if self._disconnected:
+                return
+            await _call_sdk(
+                self._client.disconnect,
+                operation="disconnect",
+                credential_values=self._credential_values,
+            )
+            self._disconnected = True
 
 
 async def _call_sdk[ResultT](

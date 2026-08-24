@@ -213,6 +213,18 @@ class RPCServer:
                 _string(params, "worker_id"),
                 _string(params, "message_id"),
             )
+        if method == "stop":
+            _validate_fields(
+                params,
+                required=("worker_id",),
+                optional=("force", "agent_id"),
+            )
+            agent_id = _string(params, "agent_id") if "agent_id" in params else None
+            return await self._supervisor.stop(
+                _string(params, "worker_id"),
+                force=_boolean(params, "force", default=False),
+                agent_id=agent_id,
+            )
         if method == "respond":
             _validate_fields(
                 params,

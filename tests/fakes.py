@@ -79,6 +79,9 @@ class FakeQoderTransport:
         del message_id
         return False
 
+    async def interrupt(self) -> None:
+        self.calls.append("interrupt")
+
     async def messages(self) -> AsyncIterator[AdapterEvent]:
         for index, event in enumerate(self._events):
             if index < len(self._event_delays):

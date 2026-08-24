@@ -103,6 +103,17 @@ async def run(
             )
             _write_json(stdout, result)
             return 0
+        if arguments.command == "stop":
+            stop_params: dict[str, JsonValue] = {
+                "worker_id": cast(str, arguments.worker_id),
+                "force": cast(bool, arguments.force),
+            }
+            agent_id = cast(str | None, arguments.agent_id)
+            if agent_id is not None:
+                stop_params["agent_id"] = agent_id
+            result = await call(socket_path, "stop", stop_params)
+            _write_json(stdout, result)
+            return 0
         if arguments.command == "respond":
             raw_response = _read_required_text(
                 cast(Path | None, arguments.response_file),
@@ -205,6 +216,12 @@ def _parser() -> _ArgumentParser:
     cancel_message.add_argument("worker_id")
     cancel_message.add_argument("message_id")
     cancel_message.add_argument("--json", action="store_true")
+
+    stop = commands.add_parser("stop")
+    stop.add_argument("worker_id")
+    stop.add_argument("--force", action="store_true")
+    stop.add_argument("--agent-id")
+    stop.add_argument("--json", action="store_true")
 
     respond = commands.add_parser("respond")
     respond.add_argument("worker_id")

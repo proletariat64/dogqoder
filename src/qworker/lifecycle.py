@@ -54,7 +54,7 @@ class AttemptRecord:
 
 
 _TRANSITIONS: dict[WorkerState, frozenset[WorkerState]] = {
-    "starting": frozenset(("running", "failed")),
+    "starting": frozenset(("running", "failed", "cancelled")),
     "running": frozenset(
         ("requires_action", "completed", "failed", "cancelled", "lost")
     ),
