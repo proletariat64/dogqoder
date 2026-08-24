@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 from collections.abc import Mapping
@@ -14,6 +15,7 @@ from qoder_agent_sdk import (
 from qworker.cli import run
 from qworker.config import ConfigError, load_config
 from qworker.domain import AuditContract
+from qworker.model_policy import AvailableModel
 from qworker.preflight import (
     AuthSelection,
     DoctorResult,
@@ -589,6 +591,60 @@ async def test_spawn_preflight_records_runtime_metadata(tmp_path: Path) -> None:
     assert worker.runtime_version == "1.2.7"
     assert inspected == [tmp_path]
     await supervisor.close()
+
+
+async def test_spawn_waiting_on_preflight_rejects_after_close(
+    tmp_path: Path,
+) -> None:
+    store = WorkerStore(tmp_path / "state")
+    preflight_started = asyncio.Event()
+    release_preflight = asyncio.Event()
+    constructed: list[Path] = []
+
+    async def gated_preflight(cwd: Path) -> DoctorResult:
+        del cwd
+        preflight_started.set()
+        await release_preflight.wait()
+        return DoctorResult(
+            ok=True,
+            sdk_version="1.0.13",
+            runtime_path="bundled",
+            runtime_version="1.1.23",
+            auth_source="qodercli",
+        )
+
+    def transport_factory(cwd: Path) -> FakeQoderTransport:
+        constructed.append(cwd)
+        return FakeQoderTransport(
+            models=(AvailableModel(value="Qwen3.8-Max", enabled=True),),
+            events=(),
+            hang_after_events=True,
+        )
+
+    supervisor = Supervisor(
+        store,
+        transport_factory,
+        sdk_version="1.0.13",
+        preflight=gated_preflight,
+    )
+    spawning = asyncio.create_task(
+        supervisor.spawn(AuditContract(objective="late spawn", cwd=tmp_path))
+    )
+    await preflight_started.wait()
+
+    await supervisor.close()
+    release_preflight.set()
+
+    with pytest.raises(SupervisorError) as rejected:
+        await spawning
+    assert rejected.value.code == "supervisor_unavailable"
+    assert store.database_path.exists() is False
+    assert constructed == []
+    assert not any(
+        task.get_name().startswith("qworker:")
+        for task in asyncio.all_tasks()
+        if task is not asyncio.current_task()
+    )
 
 
 async def test_spawn_rejects_failed_preflight_before_persistence(

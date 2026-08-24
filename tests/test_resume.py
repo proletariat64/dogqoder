@@ -379,3 +379,59 @@ async def test_json_cli_resumes_through_closed_rpc_method(tmp_path: Path) -> Non
     gate.set()
     await server.close()
     await supervisor.close()
+
+
+async def test_resume_contending_with_close_rejects_without_new_attempt(
+    tmp_path: Path,
+) -> None:
+    state_dir = tmp_path / "state"
+    store = WorkerStore(state_dir)
+    worker_id = await _create_terminal_worker(store, tmp_path, state="failed")
+    gate = asyncio.Event()
+    constructed: list[tuple[Path, str]] = []
+
+    def resume_factory(cwd: Path, session_id: str) -> GatedResumeTransport:
+        constructed.append((cwd, session_id))
+        return GatedResumeTransport(gate, session_id=session_id)
+
+    supervisor = Supervisor(
+        store,
+        lambda _: FakeQoderTransport.successful_audit(model="Qwen3.8-Max"),
+        sdk_version="1.0.13",
+        resume_transport_factory=resume_factory,
+    )
+    await supervisor._control_lock.acquire()
+    resuming = asyncio.create_task(supervisor.resume(worker_id))
+    await asyncio.sleep(0)
+    closing = asyncio.create_task(supervisor.close())
+    await asyncio.sleep(0)
+
+    supervisor._control_lock.release()
+    rejected: SupervisorError | None = None
+    try:
+        await resuming
+    except SupervisorError as error:
+        rejected = error
+    await closing
+    if rejected is None:
+        for _ in range(10):
+            if constructed:
+                break
+            await asyncio.sleep(0)
+    gate.set()
+    await supervisor.close()
+
+    verification_store = WorkerStore(state_dir)
+    worker = await verification_store.get_worker(worker_id)
+    assert rejected is not None
+    assert rejected.code == "supervisor_unavailable"
+    assert worker is not None
+    assert worker.attempt == 1
+    assert worker.state == "failed"
+    assert constructed == []
+    assert not any(
+        task.get_name().startswith("qworker:")
+        for task in asyncio.all_tasks()
+        if task is not asyncio.current_task()
+    )
+    await verification_store.close()

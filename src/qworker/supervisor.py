@@ -143,32 +143,35 @@ class Supervisor:
             sdk_version = preflight.sdk_version
             runtime_path = preflight.runtime_path
             runtime_version = preflight.runtime_version
-        worker = await self._store.create_worker(
-            role="auditor",
-            cwd=contract.cwd,
-            write_capability="read_only",
-            requested_model=contract.requested_model,
-            runtime_path=runtime_path,
-            runtime_version=runtime_version,
-            sdk_version=sdk_version,
-        )
-        task = asyncio.create_task(
-            self._run_worker(worker.worker_id, worker.attempt, contract),
-            name=f"qworker:{worker.worker_id}",
-        )
-        self._tasks[worker.worker_id] = task
+        async with self._control_lock:
+            if self._closed:
+                raise SupervisorError("supervisor_unavailable", "Supervisor is closed.")
+            worker = await self._store.create_worker(
+                role="auditor",
+                cwd=contract.cwd,
+                write_capability="read_only",
+                requested_model=contract.requested_model,
+                runtime_path=runtime_path,
+                runtime_version=runtime_version,
+                sdk_version=sdk_version,
+            )
+            task = asyncio.create_task(
+                self._run_worker(worker.worker_id, worker.attempt, contract),
+                name=f"qworker:{worker.worker_id}",
+            )
+            self._tasks[worker.worker_id] = task
 
-        def task_finished(completed: asyncio.Task[None]) -> None:
-            self._task_finished(worker.worker_id, completed)
+            def task_finished(completed: asyncio.Task[None]) -> None:
+                self._task_finished(worker.worker_id, completed)
 
-        task.add_done_callback(task_finished)
-        return {
-            "worker_id": worker.worker_id,
-            "state": worker.state,
-            "role": worker.role,
-            "cwd": str(worker.cwd),
-            "event_cursor": 1,
-        }
+            task.add_done_callback(task_finished)
+            return {
+                "worker_id": worker.worker_id,
+                "state": worker.state,
+                "role": worker.role,
+                "cwd": str(worker.cwd),
+                "event_cursor": 1,
+            }
 
     async def resume(self, worker_id: str) -> dict[str, JsonValue]:
         """Start a fresh process using one eligible worker's conversation history."""
@@ -176,6 +179,8 @@ class Supervisor:
         if self._closed:
             raise SupervisorError("supervisor_unavailable", "Supervisor is closed.")
         async with self._control_lock:
+            if self._closed:
+                raise SupervisorError("supervisor_unavailable", "Supervisor is closed.")
             worker = await self._require_worker(worker_id)
             if worker.state not in ("lost", "failed", "cancelled"):
                 raise SupervisorError(
@@ -653,11 +658,16 @@ class Supervisor:
     async def close(self) -> None:
         """Cancel live worker tasks and close supervisor-owned durable state."""
 
+        # Publish shutdown intent before waiting so queued acceptance cannot win
+        # the lock after close has begun.
         self._closed = True
-        for worker_id in tuple(self._tasks):
+        async with self._control_lock:
+            self._closed = True
+            worker_ids = tuple(self._tasks)
+            tasks = tuple(self._tasks.values())
+        for worker_id in worker_ids:
             with suppress(SupervisorError):
                 await self.stop(worker_id, force=True)
-        tasks = tuple(self._tasks.values())
         for task in tasks:
             if not task.done():
                 task.cancel()
