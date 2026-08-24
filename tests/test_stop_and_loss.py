@@ -1,5 +1,6 @@
 import asyncio
 import json
+import tempfile
 from collections.abc import AsyncIterator, Mapping
 from io import StringIO
 from pathlib import Path
@@ -312,6 +313,63 @@ async def test_grace_timeout_bounds_a_stuck_interrupt(tmp_path: Path) -> None:
     assert stopped["state"] == "cancelled"
     assert order == ["interrupt", "disconnect"]
     await supervisor.close()
+
+
+@pytest.mark.parametrize("joining_call", ("force", "close"))
+async def test_joining_force_escalates_a_blocked_graceful_stop(
+    tmp_path: Path,
+    joining_call: Literal["force", "close"],
+) -> None:
+    class BlockedInterruptTransport(StoppableFakeQoderTransport):
+        def __init__(self, order: list[str]) -> None:
+            super().__init__(order)
+            self.interrupt_started = asyncio.Event()
+
+        async def interrupt(self) -> None:
+            self._order.append("interrupt")
+            self.interrupt_started.set()
+            await asyncio.Event().wait()
+
+    order: list[str] = []
+    transport = BlockedInterruptTransport(order)
+    store = WorkerStore(tmp_path / "state")
+    supervisor = Supervisor(
+        store,
+        lambda _cwd: transport,
+        sdk_version="1.0.13",
+        stop_timeout=0.1,
+    )
+    worker_id = await _spawn_running(supervisor, tmp_path)
+    normal_stop = asyncio.create_task(supervisor.stop(worker_id))
+    await asyncio.wait_for(transport.interrupt_started.wait(), timeout=0.1)
+    joining = asyncio.create_task(
+        supervisor.close()
+        if joining_call == "close"
+        else supervisor.stop(worker_id, force=True)
+    )
+
+    try:
+        await asyncio.wait_for(asyncio.shield(joining), timeout=0.05)
+        await asyncio.wait_for(normal_stop, timeout=0.05)
+    finally:
+        if not joining.done():
+            joining.cancel()
+        await asyncio.gather(joining, return_exceptions=True)
+        await asyncio.wait_for(normal_stop, timeout=0.2)
+        if joining_call != "close":
+            await supervisor.close()
+
+    status = await supervisor.status(worker_id)
+    terminal_states = [
+        event.payload["state"]
+        for event in await store.events_since(worker_id)
+        if event.type == "worker.state_changed"
+        and event.payload.get("state") in _TERMINAL_STATE_NAMES
+    ]
+    assert status["state"] == "cancelled"
+    assert status["health"] == "exited"
+    assert terminal_states == ["cancelled"]
+    assert order == ["interrupt", "disconnect"]
 
 
 @pytest.mark.parametrize("operation", ("normal", "force", "close"))
@@ -796,11 +854,9 @@ async def _exercise_overlapping_result_stop(
     )
     for _ in range(10):
         await asyncio.sleep(0)
+    transport.allow_force_disconnect.set()
     transport.allow_interrupt.set()
     await asyncio.wait_for(store.record_started.wait(), timeout=0.2)
-    for _ in range(10):
-        await asyncio.sleep(0)
-    transport.allow_force_disconnect.set()
     for _ in range(10):
         await asyncio.sleep(0)
     store.allow_record.set()
@@ -946,34 +1002,130 @@ async def test_sdk_process_error_becomes_eof_without_exposing_stderr() -> None:
     assert "must-not-cross-adapter" not in str(captured.value)
 
 
-def test_sdk_abort_kills_a_live_cli_process_without_waiting() -> None:
-    class LiveProcess:
-        returncode: int | None = None
+class AbortProcess:
+    def __init__(
+        self,
+        *,
+        returncode: int | None = None,
+        kill_error: Exception | None = None,
+    ) -> None:
+        self.returncode = returncode
+        self.kill_error = kill_error
+        self.kill_calls = 0
 
-        def __init__(self) -> None:
-            self.killed = False
+    def kill(self) -> None:
+        self.kill_calls += 1
+        if self.kill_error is not None:
+            raise self.kill_error
 
-        def kill(self) -> None:
-            self.killed = True
 
-    class RuntimeTransport:
-        def __init__(self, process: LiveProcess) -> None:
-            self._process = process
+class AbortRuntimeTransport:
+    def __init__(self, process: AbortProcess, payload_path: Path | None) -> None:
+        self._process = process
+        self._auth_payload_path = payload_path
 
-    class Query:
-        def __init__(self, process: LiveProcess) -> None:
-            self.transport = RuntimeTransport(process)
 
-    class Client:
-        def __init__(self, process: LiveProcess) -> None:
-            self._query = Query(process)
+class AbortQuery:
+    def __init__(self, transport: AbortRuntimeTransport) -> None:
+        self.transport = transport
 
-    process = LiveProcess()
-    transport = QoderSDKTransport(Client(process))
+
+class AbortClient:
+    def __init__(
+        self,
+        runtime_transport: AbortRuntimeTransport | None,
+        *,
+        query_present: bool,
+    ) -> None:
+        self._query = (
+            AbortQuery(runtime_transport)
+            if query_present and runtime_transport is not None
+            else None
+        )
+        self._transport = runtime_transport if not query_present else None
+        self.disconnect_calls = 0
+
+    async def disconnect(self) -> None:
+        self.disconnect_calls += 1
+
+
+def _sdk_payload_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    auth_dir = tmp_path / "qoder-sdk-auth-test"
+    auth_dir.mkdir()
+    payload_path = auth_dir / "payload.json"
+    payload_path.touch(mode=0o600)
+    return payload_path
+
+
+@pytest.mark.parametrize("query_present", (True, False))
+async def test_sdk_abort_cleans_query_and_early_transport_payloads(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    query_present: bool,
+) -> None:
+    payload_path = _sdk_payload_path(tmp_path, monkeypatch)
+    process = AbortProcess()
+    runtime_transport = AbortRuntimeTransport(process, payload_path)
+    client = AbortClient(runtime_transport, query_present=query_present)
+    transport = QoderSDKTransport(client)
 
     transport.abort()
+    await transport.disconnect()
 
-    assert process.killed is True
+    assert process.kill_calls == 1
+    assert not payload_path.exists()
+    assert not payload_path.parent.exists()
+    assert runtime_transport._auth_payload_path is None
+    assert client.disconnect_calls == 0
+
+
+async def test_sdk_abort_does_not_kill_an_exited_process_and_cleans_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload_path = _sdk_payload_path(tmp_path, monkeypatch)
+    process = AbortProcess(returncode=17)
+    runtime_transport = AbortRuntimeTransport(process, payload_path)
+    client = AbortClient(runtime_transport, query_present=True)
+    transport = QoderSDKTransport(client)
+
+    transport.abort()
+    await transport.disconnect()
+
+    assert process.kill_calls == 0
+    assert not payload_path.exists()
+    assert not payload_path.parent.exists()
+    assert client.disconnect_calls == 0
+
+
+async def test_sdk_abort_kill_failure_keeps_normal_cleanup_available(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload_path = _sdk_payload_path(tmp_path, monkeypatch)
+    process = AbortProcess(kill_error=RuntimeError("kill failed"))
+    runtime_transport = AbortRuntimeTransport(process, payload_path)
+    client = AbortClient(runtime_transport, query_present=True)
+    transport = QoderSDKTransport(client)
+
+    transport.abort()
+    await transport.disconnect()
+
+    assert process.kill_calls == 1
+    assert not payload_path.exists()
+    assert not payload_path.parent.exists()
+    assert client.disconnect_calls == 1
+
+
+async def test_sdk_abort_without_a_safe_fallback_allows_later_disconnect() -> None:
+    client = AbortClient(None, query_present=False)
+    transport = QoderSDKTransport(client)
+
+    transport.abort()
+    await transport.disconnect()
+
+    assert client.disconnect_calls == 1
 
 
 def test_starting_worker_can_be_cancelled_but_not_completed() -> None:

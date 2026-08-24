@@ -41,6 +41,12 @@ class _LiveAttempt:
     transport: QoderTransport
 
 
+@dataclass(frozen=True, slots=True)
+class _StopOperation:
+    task: asyncio.Task[None]
+    escalation: asyncio.Event
+
+
 class SupervisorError(Exception):
     """Stable supervisor error suitable for an RPC response."""
 
@@ -76,7 +82,7 @@ class Supervisor:
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._live_attempts: dict[str, _LiveAttempt] = {}
         self._result_phases: dict[tuple[str, int], asyncio.Task[None]] = {}
-        self._stop_operations: dict[tuple[str, int], asyncio.Task[None]] = {}
+        self._stop_operations: dict[tuple[str, int], _StopOperation] = {}
         self._stop_requests: set[tuple[str, int]] = set()
         self._pending_approvals: dict[str, PendingApproval] = {}
         self._control_lock = asyncio.Lock()
@@ -245,22 +251,28 @@ class Supervisor:
                 live = self._live_attempts.get(worker_id)
                 if live is not None and live.attempt != attempt:
                     live = None
-                operation = asyncio.create_task(
-                    self._stop_attempt(worker_id, attempt, task, live, force=force),
+                escalation = asyncio.Event()
+                if force:
+                    escalation.set()
+                operation_task = asyncio.create_task(
+                    self._stop_attempt(worker_id, attempt, task, live, escalation),
                     name=f"qworker-stop:{worker_id}",
                 )
+                operation = _StopOperation(operation_task, escalation)
                 self._stop_operations[stop_key] = operation
 
                 def operation_finished(completed: asyncio.Task[None]) -> None:
-                    if self._stop_operations.get(stop_key) is completed:
+                    if self._stop_operations.get(stop_key) is operation:
                         self._stop_operations.pop(stop_key, None)
                     if not completed.cancelled():
                         with suppress(asyncio.CancelledError):
                             completed.exception()
 
-                operation.add_done_callback(operation_finished)
+                operation_task.add_done_callback(operation_finished)
+            elif force:
+                operation.escalation.set()
 
-        await asyncio.shield(operation)
+        await asyncio.shield(operation.task)
         status = await self.status(worker_id)
         status["force"] = force
         return status
@@ -271,8 +283,7 @@ class Supervisor:
         attempt: int,
         task: asyncio.Task[None],
         live: _LiveAttempt | None,
-        *,
-        force: bool,
+        escalation: asyncio.Event,
     ) -> None:
         """Run the sole stop operation for one attempt; concurrent callers join it."""
 
@@ -287,27 +298,21 @@ class Supervisor:
             self._stop_requests.discard(stop_key)
             return
 
-        if live is None and not force:
+        if live is None and not escalation.is_set():
             await asyncio.sleep(0)
             current = self._live_attempts.get(worker_id)
             if current is not None and current.attempt == attempt:
                 live = current
 
-        terminate = force
-        if not force and live is not None:
-            try:
-                async with asyncio.timeout_at(deadline):
-                    await live.transport.interrupt()
-            except Exception:  # noqa: BLE001 -- close after any interrupt failure
-                terminate = True
-            if not terminate:
-                remaining = max(
-                    0.0,
-                    deadline - asyncio.get_running_loop().time(),
-                )
-                done, _pending = await asyncio.wait((task,), timeout=remaining)
-                terminate = not done
-        elif not force:
+        terminate = escalation.is_set()
+        if not terminate and live is not None:
+            terminate = await self._wait_for_graceful_stop(
+                live.transport,
+                task,
+                escalation,
+                deadline,
+            )
+        elif not terminate:
             terminate = True
 
         if terminate:
@@ -324,6 +329,54 @@ class Supervisor:
             missing_state="cancelled",
         )
         self._stop_requests.discard(stop_key)
+
+    async def _wait_for_graceful_stop(
+        self,
+        transport: QoderTransport,
+        owner: asyncio.Task[None],
+        escalation: asyncio.Event,
+        deadline: float,
+    ) -> bool:
+        """Return whether teardown is needed, with force able to preempt grace."""
+
+        interrupt = asyncio.create_task(transport.interrupt())
+        escalation_wait = asyncio.create_task(escalation.wait())
+        interrupt_consumed = False
+        try:
+            remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+            done, _pending = await asyncio.wait(
+                (interrupt, escalation_wait),
+                timeout=remaining,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if escalation_wait in done:
+                return True
+            if interrupt not in done:
+                return True
+            try:
+                await interrupt
+                interrupt_consumed = True
+            except asyncio.CancelledError:
+                interrupt_consumed = True
+                return True
+            except Exception:  # noqa: BLE001 -- close after any interrupt failure
+                interrupt_consumed = True
+                return True
+            if escalation.is_set():
+                return True
+            remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+            done, _pending = await asyncio.wait(
+                (owner, escalation_wait),
+                timeout=remaining,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            return escalation_wait in done or owner not in done
+        finally:
+            escalation_wait.cancel()
+            if not interrupt.done():
+                interrupt.cancel()
+            if not interrupt_consumed:
+                interrupt.add_done_callback(_consume_task_exception)
 
     async def _disconnect_before(
         self,
@@ -847,6 +900,12 @@ class Supervisor:
         if not completed.cancelled():
             with suppress(asyncio.CancelledError):
                 completed.exception()
+
+
+def _consume_task_exception(completed: asyncio.Task[None]) -> None:
+    if not completed.cancelled():
+        with suppress(asyncio.CancelledError):
+            completed.exception()
 
 
 def _worker_json(worker: WorkerRecord, *, event_cursor: int) -> dict[str, JsonValue]:

@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import tempfile
 from collections.abc import (
     AsyncIterable,
     AsyncIterator,
@@ -76,6 +77,7 @@ _CREDENTIAL_ENV_VARS = (
     "QODERCN_SERVICE_ACCOUNT_KEY",
 )
 _MAX_SYSTEM_DIAGNOSTIC_CHARS = 512
+_MISSING = object()
 
 type AdapterDiagnosticCode = Literal[
     "auth_required",
@@ -219,6 +221,11 @@ class _SDKClient(Protocol):
     def receive_messages(self) -> AsyncIterator[object]: ...
 
     async def disconnect(self) -> None: ...
+
+
+class _PinnedSDKSubprocessTransport(Protocol):
+    _process: object | None
+    _auth_payload_path: Path | None
 
 
 class QoderSDKTransport:
@@ -423,20 +430,92 @@ class QoderSDKTransport:
             self._disconnected = True
 
     def abort(self) -> None:
-        """Best-effort synchronous kill when SDK teardown cannot meet its deadline."""
+        """Safely own pinned-SDK subprocess and credential fallback cleanup."""
 
-        self._disconnected = True
-        query = getattr(self._client, "_query", None)
-        transport = getattr(query, "transport", None)
-        process = getattr(transport, "_process", None)
-        if process is None or getattr(process, "returncode", None) is not None:
+        transport = _sdk_subprocess_transport(self._client)
+        if transport is None:
             return
-        kill = getattr(process, "kill", None)
-        if callable(kill):
-            try:
-                kill()
-            except ProcessLookupError:
-                pass
+        process_handled = _abort_sdk_process(transport)
+        credentials_handled = _cleanup_sdk_auth_payload(transport)
+        if process_handled and credentials_handled:
+            self._disconnected = True
+
+
+def _sdk_subprocess_transport(
+    client: object,
+) -> _PinnedSDKSubprocessTransport | None:
+    """Locate SDK 1.0.13 transport after or during query construction."""
+
+    query = getattr(client, "_query", None)
+    candidates = (getattr(query, "transport", None), getattr(client, "_transport", None))
+    seen: set[int] = set()
+    for transport in candidates:
+        if transport is None or id(transport) in seen:
+            continue
+        seen.add(id(transport))
+        if (
+            getattr(transport, "_process", _MISSING) is not _MISSING
+            and getattr(transport, "_auth_payload_path", _MISSING) is not _MISSING
+        ):
+            return cast(_PinnedSDKSubprocessTransport, transport)
+    return None
+
+
+def _abort_sdk_process(transport: _PinnedSDKSubprocessTransport) -> bool:
+    """Kill only a process whose pinned live-state marker is available."""
+
+    process = transport._process
+    if process is None:
+        return True
+    returncode = getattr(process, "returncode", _MISSING)
+    if returncode is _MISSING:
+        return False
+    if returncode is not None:
+        return True
+    kill = getattr(process, "kill", None)
+    if not callable(kill):
+        return False
+    try:
+        kill()
+    except ProcessLookupError:
+        return True
+    except Exception:  # noqa: BLE001 -- normal SDK cleanup remains retryable
+        return False
+    return True
+
+
+def _cleanup_sdk_auth_payload(transport: _PinnedSDKSubprocessTransport) -> bool:
+    """Remove only pinned SDK payload path and its empty temporary directory."""
+
+    raw_path = transport._auth_payload_path
+    if raw_path is None:
+        return True
+    if not isinstance(raw_path, Path) or not raw_path.is_absolute():
+        return False
+    auth_dir = raw_path.parent
+    try:
+        temp_root = Path(tempfile.gettempdir()).resolve(strict=True)
+        if (
+            raw_path.name != "payload.json"
+            or not auth_dir.name.startswith("qoder-sdk-auth-")
+            or auth_dir.is_symlink()
+            or auth_dir.resolve(strict=False).parent != temp_root
+            or (auth_dir.exists() and not auth_dir.is_dir())
+            or raw_path.is_symlink()
+            or (raw_path.exists() and not raw_path.is_file())
+        ):
+            return False
+        raw_path.unlink(missing_ok=True)
+        transport._auth_payload_path = None
+        try:
+            auth_dir.rmdir()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+    except OSError:
+        return False
+    return True
 
 
 async def _call_sdk[ResultT](
