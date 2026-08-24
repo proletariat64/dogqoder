@@ -216,6 +216,7 @@ async def test_create_worker_preserves_caller_workspace_with_spaced_segments(
     tmp_path: Path,
 ) -> None:
     caller_cwd = tmp_path / "Caller Workspace" / "My Qoder Worker Project"
+    caller_cwd.mkdir(parents=True)
     store = WorkerStore(tmp_path / "state")
 
     worker = await store.create_worker(
@@ -235,6 +236,30 @@ async def test_create_worker_preserves_caller_workspace_with_spaced_segments(
         "cwd": str(caller_cwd),
         "role": "coder",
     }
+
+
+async def test_create_worker_rejects_transcript_cwd_without_persisting(
+    tmp_path: Path,
+) -> None:
+    transcript_cwd = tmp_path / "this is a raw assistant transcript"
+    store = WorkerStore(tmp_path / "state")
+
+    with pytest.raises(ValueError, match="worker creation field: cwd"):
+        await store.create_worker(
+            role="auditor",
+            cwd=transcript_cwd,
+            write_capability="read_only",
+            requested_model="qwen-auditor",
+            runtime_path="bundled",
+            sdk_version="1.0.13",
+            worker_id="worker-1",
+        )
+
+    assert not store.database_path.exists()
+    assert await store.events_since("worker-1") == ()
+    with sqlite3.connect(store.database_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM workers").fetchone() == (0,)
+        assert connection.execute("SELECT COUNT(*) FROM events").fetchone() == (0,)
 
 
 @pytest.mark.parametrize(

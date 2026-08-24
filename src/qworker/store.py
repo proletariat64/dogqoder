@@ -143,6 +143,16 @@ def _runtime_path(value: JsonValue) -> bool:
     return value == "bundled" or _absolute_path(value)
 
 
+def _canonical_workspace(cwd: Path) -> Path:
+    try:
+        canonical_cwd = cwd.resolve(strict=True)
+    except (OSError, RuntimeError):
+        raise ValueError("Unsafe worker creation field: cwd") from None
+    if not canonical_cwd.is_dir():
+        raise ValueError("Unsafe worker creation field: cwd")
+    return canonical_cwd
+
+
 _IDENTIFIER = _safe_metadata
 _CODE = _safe_metadata
 _MODEL = _safe_metadata
@@ -273,7 +283,7 @@ class WorkerStore:
         """Create a stable worker identity with its first positive attempt."""
 
         worker_identifier = worker_id or _new_ulid()
-        canonical_cwd = cwd.resolve(strict=False)
+        canonical_cwd = _canonical_workspace(cwd)
         _validate_worker_creation(
             worker_id=worker_identifier,
             role=role,
