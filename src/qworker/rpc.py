@@ -21,6 +21,8 @@ from qworker.supervisor import Supervisor, SupervisorError
 type JsonObject = dict[str, JsonValue]
 
 _MAX_FRAME_BYTES = 4 * 1024 * 1024
+_MAX_REQUEST_ID_CHARS = 128
+_MAX_ENCODED_REQUEST_ID_BYTES = _MAX_REQUEST_ID_CHARS * 12 + 2
 _TERMINAL_STATES = frozenset(("completed", "failed", "cancelled", "lost"))
 _REQUEST_ID_PATTERN = re.compile(
     rb'"request_id"\s*:\s*("(?:\\.|[^"\\])*")'
@@ -256,7 +258,8 @@ async def call(
 ) -> JsonValue:
     """Perform one finite correlated RPC call."""
 
-    correlation_id = request_id or str(uuid.uuid4())
+    correlation_id = str(uuid.uuid4()) if request_id is None else request_id
+    _validate_outgoing_request_id(correlation_id)
     reader, writer = await _open_connection(socket_path)
     try:
         try:
@@ -286,7 +289,8 @@ async def watch(
 ) -> AsyncIterator[JsonObject]:
     """Yield correlated event objects from one upgraded watch connection."""
 
-    correlation_id = request_id or str(uuid.uuid4())
+    correlation_id = str(uuid.uuid4()) if request_id is None else request_id
+    _validate_outgoing_request_id(correlation_id)
     reader, writer = await _open_connection(socket_path)
     try:
         try:
@@ -460,8 +464,8 @@ def _decode_request(line: bytes) -> JsonObject:
         request,
         required=("request_id", "method", "params"),
     )
-    if not isinstance(request["request_id"], str) or not request["request_id"]:
-        raise ValueError("request_id must be a non-empty string.")
+    if not _valid_request_id(request["request_id"]):
+        raise ValueError(_request_id_validation_message())
     if not isinstance(request["method"], str) or not request["method"]:
         raise ValueError("method must be a non-empty string.")
     if not isinstance(request["params"], dict):
@@ -573,11 +577,29 @@ def _request_id_from_prefix(prefix: bytes) -> JsonValue:
     match = _REQUEST_ID_PATTERN.search(prefix)
     if match is None:
         return None
+    if match.end(1) - match.start(1) > _MAX_ENCODED_REQUEST_ID_BYTES:
+        return None
     try:
         decoded: object = json.loads(match.group(1))
     except (UnicodeDecodeError, json.JSONDecodeError):
         return None
-    return decoded if isinstance(decoded, str) else None
+    return cast(str, decoded) if _valid_request_id(decoded) else None
+
+
+def _validate_outgoing_request_id(request_id: str) -> None:
+    if not _valid_request_id(request_id):
+        raise RPCClientError("invalid_request", _request_id_validation_message())
+
+
+def _valid_request_id(value: object) -> bool:
+    return isinstance(value, str) and 0 < len(value) <= _MAX_REQUEST_ID_CHARS
+
+
+def _request_id_validation_message() -> str:
+    return (
+        "request_id must be a non-empty string of at most "
+        f"{_MAX_REQUEST_ID_CHARS} characters."
+    )
 
 
 def _frame_limit_message() -> str:

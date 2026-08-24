@@ -4,6 +4,7 @@ import os
 import sqlite3
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -449,6 +450,58 @@ async def test_rpc_rejects_over_limit_request_with_correlated_error(
     await supervisor.close()
 
 
+async def test_rpc_over_limit_request_with_near_limit_id_stays_structured(
+    tmp_path: Path,
+) -> None:
+    supervisor = Supervisor(
+        WorkerStore(tmp_path / "state"),
+        lambda _: FakeQoderTransport(models=(), events=()),
+        sdk_version="1.0.13",
+    )
+    socket_path = tmp_path / "runtime" / "qworker.sock"
+    server = RPCServer(supervisor, socket_path)
+    await server.start()
+    reader, writer = await asyncio.open_unix_connection(socket_path)
+    near_limit_id = b"r" * (4 * 1024 * 1024 - 32)
+    writer.write(
+        b'{"request_id":"'
+        + near_limit_id
+        + b'","method":"status","params":{}}\n'
+    )
+    await writer.drain()
+
+    response = await _read_response(reader)
+    assert response == {
+        "request_id": None,
+        "ok": False,
+        "error": {
+            "code": "frame_too_large",
+            "message": "RPC frame exceeds the 4194304-byte limit.",
+        },
+    }
+    writer.close()
+    await writer.wait_closed()
+    await server.close()
+    await supervisor.close()
+
+
+async def test_rpc_client_rejects_overlong_request_id_before_connecting(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(RPCClientError) as captured:
+        await call(
+            tmp_path / "missing.sock",
+            "status",
+            {"worker_id": "worker-safe"},
+            request_id="r" * 129,
+        )
+
+    assert captured.value.code == "invalid_request"
+    assert captured.value.message == (
+        "request_id must be a non-empty string of at most 128 characters."
+    )
+
+
 async def test_rpc_client_rejects_over_limit_response_structurally(
     tmp_path: Path,
 ) -> None:
@@ -555,3 +608,142 @@ async def test_result_redacts_credentials_recursively_and_in_sqlite(
     assert secret not in durable
     assert environment_secret not in durable
     await supervisor.close()
+
+
+async def test_result_redacts_opaque_values_under_credential_named_keys(
+    tmp_path: Path,
+) -> None:
+    store = WorkerStore(tmp_path / "state")
+    worker = await store.create_worker(
+        role="auditor",
+        cwd=tmp_path.parent,
+        write_capability="read_only",
+        requested_model="qwen-auditor",
+        runtime_path="bundled",
+        sdk_version="1.0.13",
+    )
+    opaque_password = "opaque-token-value"
+    opaque_api_key = "AIzaExampleOpaqueValue"
+    opaque_token = "unstructured-auth-material"
+
+    await store.record_result(
+        worker.worker_id,
+        outcome="completed",
+        result_summary={
+            "password": opaque_password,
+            "nested": {"api_key": opaque_api_key, "token": opaque_token},
+        },
+        resolved_model="Qwen3.8-Max",
+        actual_models=("Qwen3.8-Max",),
+        session_id="session-safe",
+        nested_state="settled",
+        warnings=(),
+    )
+
+    persisted = await store.get_worker(worker.worker_id)
+    assert persisted is not None
+    assert persisted.result_summary == {
+        "outcome": "completed",
+        "password": "[REDACTED]",
+        "nested": {
+            "api_key": "[REDACTED]",
+            "token": "[REDACTED]",
+        },
+    }
+    with sqlite3.connect(store.database_path) as connection:
+        durable = connection.execute(
+            "SELECT result_summary FROM workers WHERE worker_id = ?",
+            (worker.worker_id,),
+        ).fetchone()[0]
+    assert opaque_password not in durable
+    assert opaque_api_key not in durable
+    assert opaque_token not in durable
+    await store.close()
+
+
+async def test_result_budget_preserves_keys_without_redaction_collisions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment_secret = "opaque-environment-key"
+    monkeypatch.setenv("QODER_PERSONAL_ACCESS_TOKEN", environment_secret)
+    store = WorkerStore(tmp_path / "state")
+    worker = await store.create_worker(
+        role="auditor",
+        cwd=tmp_path.parent,
+        write_capability="read_only",
+        requested_model="qwen-auditor",
+        runtime_path="bundled",
+        sdk_version="1.0.13",
+    )
+
+    await store.record_result(
+        worker.worker_id,
+        outcome="completed",
+        result_summary={
+            environment_secret: "first opaque value",
+            "sk-another-secret-key": "second opaque value",
+            "confirmed": ["x" * 4096] * 128,
+            "outcome": "completed",
+            "summary": "late required summary",
+        },
+        resolved_model="Qwen3.8-Max",
+        actual_models=("Qwen3.8-Max",),
+        session_id="session-safe",
+        nested_state="settled",
+        warnings=(),
+    )
+
+    persisted = await store.get_worker(worker.worker_id)
+    assert persisted is not None
+    assert persisted.result_summary is not None
+    assert set(persisted.result_summary) == {
+        "confirmed",
+        "outcome",
+        "summary",
+        "[REDACTED]",
+        "[REDACTED]#2",
+    }
+    assert persisted.result_summary["outcome"] == "completed"
+    assert persisted.result_summary["summary"] == ""
+    assert persisted.result_summary["[REDACTED]"] == "[REDACTED]"
+    assert persisted.result_summary["[REDACTED]#2"] == "[REDACTED]"
+    await store.close()
+
+
+async def test_result_bounds_apply_before_serializing_deep_input(
+    tmp_path: Path,
+) -> None:
+    store = WorkerStore(tmp_path / "state")
+    worker = await store.create_worker(
+        role="auditor",
+        cwd=tmp_path,
+        write_capability="read_only",
+        requested_model="qwen-auditor",
+        runtime_path="bundled",
+        sdk_version="1.0.13",
+    )
+    nested: dict[str, object] = {}
+    nested["next"] = nested
+
+    await store.record_result(
+        worker.worker_id,
+        outcome="completed",
+        result_summary=cast(dict[str, JsonValue], {"deep": nested}),
+        resolved_model="Qwen3.8-Max",
+        actual_models=("Qwen3.8-Max",),
+        session_id="session-safe",
+        nested_state="settled",
+        warnings=(),
+    )
+
+    persisted = await store.get_worker(worker.worker_id)
+    assert persisted is not None
+    assert persisted.result_summary is not None
+    cursor = persisted.result_summary["deep"]
+    for _ in range(5):
+        assert isinstance(cursor, dict)
+        cursor = cursor["next"]
+    assert isinstance(cursor, dict)
+    assert cursor["next"] is None
+    await store.close()

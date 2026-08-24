@@ -38,6 +38,7 @@ _CREDENTIAL_ENV_VARS = (
     "QODERCN_SERVICE_ACCOUNT_KEY",
 )
 _MAX_RESULT_STRING_CHARS = 4096
+_MAX_RESULT_KEY_CHARS = 256
 _MAX_RESULT_COLLECTION_ITEMS = 128
 _MAX_RESULT_DEPTH = 6
 _MAX_RESULT_NODES = 2048
@@ -117,6 +118,11 @@ _INLINE_CREDENTIAL = re.compile(
 _KEYED_CREDENTIAL = re.compile(
     r"\b(?:api[_ -]?key|access[_ -]?token|secret|credential|password|authorization)"
     r"\b(?:\s*[:=]\s*|\s+)[^\s,;]+",
+    re.IGNORECASE,
+)
+_RESULT_CREDENTIAL_KEY = re.compile(
+    r"(?:api[_ -]?key|token|secret|credential|password|authorization|"
+    r"private[_ -]?key|service[_ -]?account[_ -]?key)",
     re.IGNORECASE,
 )
 
@@ -487,7 +493,7 @@ class WorkerStore:
     ) -> EventRecord:
         """Persist a structured result and its semantic event in one transaction."""
 
-        safe_result = _safe_result_summary(result_summary)
+        safe_result = _safe_result_summary(result_summary, outcome=outcome)
         if resolved_model is not None and not _MODEL(resolved_model):
             raise ValueError("Unsafe worker result field: resolved_model")
         if any(not _MODEL(model) for model in actual_models):
@@ -875,20 +881,33 @@ def _copy_json_object(payload: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
 
 def _safe_result_summary(
     result_summary: Mapping[str, JsonValue],
+    *,
+    outcome: Literal["completed", "partial", "blocked", "failed"],
 ) -> dict[str, JsonValue]:
-    copied = _copy_json_object(result_summary)
-    sanitized = _sanitize_result_value(copied, depth=0, budget=_ResultBudget())
+    sanitized = _sanitize_result_value(
+        result_summary,
+        depth=0,
+        budget=_ResultBudget(
+            text_chars=_MAX_RESULT_TEXT_CHARS - len(outcome)
+        ),
+        secret_context=False,
+    )
     if not isinstance(sanitized, dict):
         raise TypeError("Structured result must remain a JSON object.")
+    if "outcome" not in sanitized and len(sanitized) == _MAX_RESULT_COLLECTION_ITEMS:
+        sanitized.pop(next(reversed(sanitized)))
+    sanitized["outcome"] = outcome
     return sanitized
 
 
 def _sanitize_result_value(
-    value: JsonValue, *, depth: int, budget: _ResultBudget
+    value: object, *, depth: int, budget: _ResultBudget, secret_context: bool
 ) -> JsonValue:
     if budget.nodes <= 0 or depth > _MAX_RESULT_DEPTH:
         return None
     budget.nodes -= 1
+    if secret_context:
+        return _safe_result_text("[REDACTED]", budget)
     if isinstance(value, str):
         return _safe_result_text(value, budget)
     if isinstance(value, list):
@@ -897,23 +916,74 @@ def _sanitize_result_value(
             if index == _MAX_RESULT_COLLECTION_ITEMS or budget.nodes <= 0:
                 break
             sanitized_list.append(
-                _sanitize_result_value(item, depth=depth + 1, budget=budget)
+                _sanitize_result_value(
+                    item,
+                    depth=depth + 1,
+                    budget=budget,
+                    secret_context=False,
+                )
             )
         return sanitized_list
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         sanitized_object: dict[str, JsonValue] = {}
         for index, (key, item) in enumerate(value.items()):
             if index == _MAX_RESULT_COLLECTION_ITEMS or budget.nodes <= 0:
                 break
-            safe_key = _safe_result_text(key, budget)
+            if not isinstance(key, str):
+                raise TypeError("Structured result keys must be strings.")
+            safe_key = _unique_result_key(
+                _safe_result_key(key), sanitized_object
+            )
             sanitized_object[safe_key] = _sanitize_result_value(
-                item, depth=depth + 1, budget=budget
+                item,
+                depth=depth + 1,
+                budget=budget,
+                secret_context=_credential_result_key(key),
             )
         return sanitized_object
-    return value
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    raise TypeError("Structured result contains a non-JSON value.")
+
+
+def _credential_result_key(key: str) -> bool:
+    if _RESULT_CREDENTIAL_KEY.search(key) or _contains_sensitive_marker(key):
+        return True
+    for variable in _CREDENTIAL_ENV_VARS:
+        secret = os.environ.get(variable)
+        if secret and secret in key:
+            return True
+    return False
+
+
+def _safe_result_key(key: str) -> str:
+    return _redact_result_text(key)[:_MAX_RESULT_KEY_CHARS]
+
+
+def _unique_result_key(
+    candidate: str, existing: Mapping[str, JsonValue]
+) -> str:
+    if candidate not in existing:
+        return candidate
+    index = 2
+    while True:
+        suffix = f"#{index}"
+        unique = candidate[: _MAX_RESULT_KEY_CHARS - len(suffix)] + suffix
+        if unique not in existing:
+            return unique
+        index += 1
 
 
 def _safe_result_text(value: str, budget: _ResultBudget) -> str:
+    safe = _redact_result_text(value)
+    limit = min(_MAX_RESULT_STRING_CHARS, max(budget.text_chars, 0))
+    if len(safe) > limit:
+        safe = safe[: max(limit - 3, 0)] + ("..." if limit >= 3 else "")
+    budget.text_chars -= len(safe)
+    return safe
+
+
+def _redact_result_text(value: str) -> str:
     safe = value
     for variable in _CREDENTIAL_ENV_VARS:
         secret = os.environ.get(variable)
@@ -921,10 +991,6 @@ def _safe_result_text(value: str, budget: _ResultBudget) -> str:
             safe = safe.replace(secret, "[REDACTED]")
     safe = _INLINE_CREDENTIAL.sub("[REDACTED]", safe)
     safe = _KEYED_CREDENTIAL.sub("[REDACTED]", safe)
-    limit = min(_MAX_RESULT_STRING_CHARS, max(budget.text_chars, 0))
-    if len(safe) > limit:
-        safe = safe[: max(limit - 3, 0)] + ("..." if limit >= 3 else "")
-    budget.text_chars -= len(safe)
     return safe
 
 

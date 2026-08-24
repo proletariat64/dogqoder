@@ -3,6 +3,8 @@ import json
 from io import StringIO
 from pathlib import Path
 
+import pytest
+
 from qworker.cli import run
 from qworker.rpc import RPCServer
 from qworker.store import WorkerStore
@@ -77,8 +79,10 @@ async def test_json_spawn_can_disable_supervisor_auto_start(tmp_path: Path) -> N
     )
 
 
+@pytest.mark.parametrize("input_mode", ("spec_file", "stdin"))
 async def test_json_spawn_exits_zero_on_acceptance_without_claiming_completion(
     tmp_path: Path,
+    input_mode: str,
 ) -> None:
     gate = asyncio.Event()
     supervisor = Supervisor(
@@ -91,6 +95,10 @@ async def test_json_spawn_exits_zero_on_acceptance_without_claiming_completion(
     await server.start()
     spec_file = tmp_path / "audit-spec.txt"
     spec_file.write_text("x" * 70_000, encoding="utf-8")
+    spec_arguments = (
+        ["--spec-file", str(spec_file)] if input_mode == "spec_file" else []
+    )
+    stdin = StringIO() if input_mode == "spec_file" else StringIO("x" * 70_000)
     stdout = StringIO()
 
     exit_code = await run(
@@ -102,11 +110,10 @@ async def test_json_spawn_exits_zero_on_acceptance_without_claiming_completion(
             "auditor",
             "--cwd",
             str(tmp_path),
-            "--spec-file",
-            str(spec_file),
+            *spec_arguments,
             "--json",
         ],
-        stdin=StringIO(),
+        stdin=stdin,
         stdout=stdout,
     )
 
@@ -150,8 +157,10 @@ async def test_qworker_console_entrypoint_emits_json_connection_error(
     }
 
 
+@pytest.mark.parametrize("reset", (False, True), ids=("eof", "reset"))
 async def test_follow_watch_disconnect_after_ack_is_structured_failure(
     tmp_path: Path,
+    reset: bool,
 ) -> None:
     socket_path = tmp_path / "dropped-watch.sock"
 
@@ -174,8 +183,11 @@ async def test_follow_watch_disconnect_after_ack_is_structured_failure(
             + b"\n"
         )
         await writer.drain()
-        writer.close()
-        await writer.wait_closed()
+        if reset:
+            writer.transport.abort()
+        else:
+            writer.close()
+            await writer.wait_closed()
 
     server = await asyncio.start_unix_server(
         acknowledge_then_drop, path=socket_path
