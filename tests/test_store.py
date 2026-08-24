@@ -19,18 +19,32 @@ async def test_store_round_trips_workers_attempts_and_ordered_events(
         runtime_path="bundled",
         sdk_version="1.0.13",
     )
-    await store.append_event(worker.worker_id, "runtime.started", {"pid": 42})
+    await store.append_event(
+        worker.worker_id,
+        "runtime.started",
+        {"schema_version": 1, "pid": 42},
+    )
     await store.append_event(
         worker.worker_id,
         "model.resolved",
-        {"model": "Qwen3.8-Max"},
+        {"schema_version": 1, "model": "Qwen3.8-Max"},
     )
-    await store.append_event(worker.worker_id, "runtime.exited", {"exit_code": 1})
     await store.append_event(
-        worker.worker_id, "worker.state_changed", {"state": "failed"}
+        worker.worker_id,
+        "runtime.exited",
+        {"schema_version": 1, "exit_code": 1},
+    )
+    await store.append_event(
+        worker.worker_id,
+        "worker.state_changed",
+        {"schema_version": 1, "state": "failed"},
     )
     retry = await store.start_attempt(worker.worker_id)
-    await store.append_event(retry.worker_id, "runtime.started", {"pid": 43})
+    await store.append_event(
+        retry.worker_id,
+        "runtime.started",
+        {"schema_version": 1, "pid": 43},
+    )
 
     restored = await store.get_worker(worker.worker_id)
     events = await store.events_since(worker.worker_id, since=1)
@@ -77,3 +91,85 @@ async def test_store_creates_private_state_directory_and_database(
 
     assert store.state_dir.stat().st_mode & 0o777 == 0o700
     assert store.database_path.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize("terminal_state", ("failed", "cancelled", "lost"))
+async def test_append_event_cannot_resume_without_a_new_attempt(
+    tmp_path: Path,
+    terminal_state: str,
+) -> None:
+    store = WorkerStore(tmp_path / "state")
+    worker = await store.create_worker(
+        role="auditor",
+        cwd=tmp_path,
+        write_capability="read_only",
+        requested_model="qwen-auditor",
+        runtime_path="bundled",
+        sdk_version="1.0.13",
+    )
+    if terminal_state != "failed":
+        await store.append_event(
+            worker.worker_id,
+            "worker.state_changed",
+            {"schema_version": 1, "state": "running"},
+        )
+    await store.append_event(
+        worker.worker_id,
+        "worker.state_changed",
+        {"schema_version": 1, "state": terminal_state},
+    )
+
+    with pytest.raises(ValueError, match="start_attempt"):
+        await store.append_event(
+            worker.worker_id,
+            "worker.state_changed",
+            {"schema_version": 1, "state": "starting"},
+        )
+
+    current = await store.get_worker(worker.worker_id)
+    assert current is not None
+    assert current.attempt == 1
+    assert (await store.start_attempt(worker.worker_id)).attempt == 2
+
+
+@pytest.mark.parametrize(
+    ("event_type", "payload"),
+    (
+        ("assistant.message", {"schema_version": 1, "message": "raw transcript"}),
+        ("assistant.message", {"schema_version": 1, "token_delta": "delta"}),
+        ("assistant.message", {"schema_version": 1, "tool_input": {"path": "/tmp"}}),
+        (
+            "tool.started",
+            {"schema_version": 1, "tool_name": "Read", "api_key": "secret"},
+        ),
+        ("assistant.message", {"schema_version": 1, "access_token": "secret"}),
+        ("assistant.message", {"schema_version": 1, "authorization": "secret"}),
+        ("assistant.message", {"schema_version": 1, "password": "secret"}),
+        ("assistant.message", {"model": "Qwen3.8-Max"}),
+        ("assistant.message", {"schema_version": True}),
+        ("assistant.message", {"schema_version": 2}),
+        ("model.resolved", {"schema_version": 1}),
+        ("model.resolved", {"schema_version": 1, "model": "x" * 257}),
+    ),
+)
+async def test_store_rejects_unversioned_or_nonsemantic_payloads(
+    tmp_path: Path,
+    event_type: str,
+    payload: dict[str, object],
+) -> None:
+    store = WorkerStore(tmp_path / "state")
+    worker = await store.create_worker(
+        role="auditor",
+        cwd=tmp_path,
+        write_capability="read_only",
+        requested_model="qwen-auditor",
+        runtime_path="bundled",
+        sdk_version="1.0.13",
+    )
+
+    with pytest.raises(ValueError, match="payload|schema_version"):
+        await store.append_event(worker.worker_id, event_type, payload)  # type: ignore[arg-type]
+
+    assert [event.type for event in await store.events_since(worker.worker_id)] == [
+        "worker.created"
+    ]

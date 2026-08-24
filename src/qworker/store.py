@@ -5,7 +5,7 @@ import os
 import secrets
 import sqlite3
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -26,46 +26,10 @@ type JsonValue = (
     None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
 )
 
-_EVENT_TYPES = frozenset(
-    (
-        "worker.created",
-        "worker.state_changed",
-        "worker.health_changed",
-        "runtime.started",
-        "runtime.initialized",
-        "model.resolved",
-        "assistant.message",
-        "tool.started",
-        "tool.finished",
-        "nested.started",
-        "nested.progress",
-        "nested.terminal",
-        "approval.requested",
-        "approval.resolved",
-        "steer.queued",
-        "steer.delivered",
-        "steer.cancelled",
-        "result.received",
-        "worker.warning",
-        "runtime.exited",
-    )
-)
-_FORBIDDEN_PAYLOAD_KEY_PARTS = frozenset(
-    (
-        "token",
-        "secret",
-        "credential",
-        "password",
-        "authorization",
-        "transcript",
-        "stdout",
-        "delta",
-    )
-)
-_FORBIDDEN_PAYLOAD_KEYS = frozenset(("text", "content", "raw", "prompt", "tool_input"))
 _CROCKFORD_BASE32 = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 _TERMINAL_STATES = frozenset(("completed", "failed", "cancelled", "lost"))
 _WORKER_HEALTH = frozenset(("unknown", "healthy", "quiet", "stalled", "exited"))
+_EVENT_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +49,138 @@ class EventRecord:
         """Alias for callers that avoid the built-in name ``type``."""
 
         return self.type
+
+
+type _PayloadValidator = Callable[[JsonValue], bool]
+
+
+@dataclass(frozen=True, slots=True)
+class _EventSchema:
+    """Strict bounded field contract for one persisted semantic event type."""
+
+    required: Mapping[str, _PayloadValidator]
+    optional: Mapping[str, _PayloadValidator]
+
+
+def _positive_integer(value: JsonValue) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _non_negative_integer(value: JsonValue) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _boolean(value: JsonValue) -> bool:
+    return isinstance(value, bool)
+
+
+def _bounded_string(maximum_length: int) -> _PayloadValidator:
+    def validate(value: JsonValue) -> bool:
+        return isinstance(value, str) and 0 < len(value) <= maximum_length
+
+    return validate
+
+
+def _one_of(*values: str) -> _PayloadValidator:
+    allowed = frozenset(values)
+
+    def validate(value: JsonValue) -> bool:
+        return isinstance(value, str) and value in allowed
+
+    return validate
+
+
+_IDENTIFIER = _bounded_string(128)
+_CODE = _bounded_string(128)
+_MODEL = _bounded_string(256)
+_PATH = _bounded_string(4096)
+_RUNTIME_VERSION = _bounded_string(256)
+_EVENT_SCHEMAS: dict[str, _EventSchema] = {
+    "worker.created": _EventSchema(
+        required={
+            "attempt": _positive_integer,
+            "cwd": _PATH,
+            "role": _one_of("coder", "auditor"),
+        },
+        optional={},
+    ),
+    "worker.state_changed": _EventSchema(
+        required={
+            "state": _one_of(
+                "starting",
+                "running",
+                "requires_action",
+                "completed",
+                "failed",
+                "cancelled",
+                "lost",
+            )
+        },
+        optional={"attempt": _positive_integer},
+    ),
+    "worker.health_changed": _EventSchema(
+        required={
+            "health": _one_of("unknown", "healthy", "quiet", "stalled", "exited")
+        },
+        optional={},
+    ),
+    "runtime.started": _EventSchema(required={}, optional={"pid": _positive_integer}),
+    "runtime.initialized": _EventSchema(
+        required={},
+        optional={"runtime_version": _RUNTIME_VERSION, "session_id": _IDENTIFIER},
+    ),
+    "model.resolved": _EventSchema(required={"model": _MODEL}, optional={}),
+    "assistant.message": _EventSchema(required={}, optional={"model": _MODEL}),
+    "tool.started": _EventSchema(required={"tool_name": _IDENTIFIER}, optional={}),
+    "tool.finished": _EventSchema(
+        required={"tool_name": _IDENTIFIER},
+        optional={"duration_ms": _non_negative_integer, "succeeded": _boolean},
+    ),
+    "nested.started": _EventSchema(required={"task_id": _IDENTIFIER}, optional={}),
+    "nested.progress": _EventSchema(
+        required={"task_id": _IDENTIFIER}, optional={"tool_name": _IDENTIFIER}
+    ),
+    "nested.terminal": _EventSchema(
+        required={
+            "task_id": _IDENTIFIER,
+            "status": _one_of("completed", "failed", "stopped"),
+        },
+        optional={},
+    ),
+    "approval.requested": _EventSchema(
+        required={
+            "request_id": _IDENTIFIER,
+            "kind": _one_of("tool_permission", "elicitation", "mcp_oauth"),
+        },
+        optional={"agent_id": _IDENTIFIER},
+    ),
+    "approval.resolved": _EventSchema(
+        required={
+            "request_id": _IDENTIFIER,
+            "status": _one_of("allowed", "denied", "answered", "expired"),
+        },
+        optional={},
+    ),
+    "steer.queued": _EventSchema(
+        required={
+            "message_id": _IDENTIFIER,
+            "priority": _one_of("now", "next", "later"),
+        },
+        optional={},
+    ),
+    "steer.delivered": _EventSchema(required={"message_id": _IDENTIFIER}, optional={}),
+    "steer.cancelled": _EventSchema(
+        required={"message_id": _IDENTIFIER}, optional={"cancelled": _boolean}
+    ),
+    "result.received": _EventSchema(
+        required={"outcome": _one_of("completed", "partial", "blocked", "failed")},
+        optional={"model": _MODEL},
+    ),
+    "worker.warning": _EventSchema(required={"code": _CODE}, optional={}),
+    "runtime.exited": _EventSchema(
+        required={}, optional={"exit_code": _non_negative_integer}
+    ),
+}
 
 
 class WorkerStore:
@@ -162,7 +258,12 @@ class WorkerStore:
                 worker_id=worker_identifier,
                 attempt=1,
                 event_type="worker.created",
-                payload={"attempt": 1, "cwd": str(canonical_cwd), "role": role},
+                payload={
+                    "schema_version": _EVENT_SCHEMA_VERSION,
+                    "attempt": 1,
+                    "cwd": str(canonical_cwd),
+                    "role": role,
+                },
                 timestamp=created_at,
             )
             connection.commit()
@@ -208,7 +309,11 @@ class WorkerStore:
                 worker_id=worker_id,
                 attempt=attempt,
                 event_type="worker.state_changed",
-                payload={"attempt": attempt, "state": "starting"},
+                payload={
+                    "schema_version": _EVENT_SCHEMA_VERSION,
+                    "attempt": attempt,
+                    "state": "starting",
+                },
                 timestamp=created_at,
             )
             connection.commit()
@@ -233,7 +338,11 @@ class WorkerStore:
         """Append one allowed semantic event and return its durable cursor."""
 
         connection = self._open()
-        safe_payload = _validated_payload(payload)
+        safe_payload = _validated_payload(event_type, payload)
+        if event_type == "worker.state_changed" and safe_payload["state"] == "starting":
+            raise ValueError(
+                "Use start_attempt() to create a resumed starting attempt."
+            )
         try:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
@@ -363,9 +472,7 @@ class WorkerStore:
         payload: Mapping[str, JsonValue],
         timestamp: datetime,
     ) -> EventRecord:
-        if event_type not in _EVENT_TYPES:
-            raise ValueError(f"Unsupported semantic event type: {event_type}")
-        safe_payload = _validated_payload(payload)
+        safe_payload = _validated_payload(event_type, payload)
         row = connection.execute(
             "SELECT COALESCE(MAX(sequence), 0) AS last_sequence FROM events WHERE worker_id = ?",
             (worker_id,),
@@ -503,14 +610,35 @@ def _event_from_row(row: sqlite3.Row) -> EventRecord:
     )
 
 
-def _validated_payload(payload: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
+def _validated_payload(
+    event_type: str, payload: Mapping[str, JsonValue]
+) -> dict[str, JsonValue]:
+    schema = _EVENT_SCHEMAS.get(event_type)
+    if schema is None:
+        raise ValueError(f"Unsupported semantic event type: {event_type}")
     copied = _copy_json_object(payload)
-    for key in _walk_payload_keys(copied):
-        normalized_key = key.casefold()
-        if normalized_key in _FORBIDDEN_PAYLOAD_KEYS or any(
-            part in normalized_key for part in _FORBIDDEN_PAYLOAD_KEY_PARTS
-        ):
-            raise ValueError(f"Non-semantic payload field is not persistable: {key}")
+    version = copied.get("schema_version")
+    if (
+        not isinstance(version, int)
+        or isinstance(version, bool)
+        or version != _EVENT_SCHEMA_VERSION
+    ):
+        raise ValueError(
+            f"Event payload requires schema_version={_EVENT_SCHEMA_VERSION}."
+        )
+    allowed = frozenset(("schema_version", *schema.required, *schema.optional))
+    unexpected = set(copied).difference(allowed)
+    if unexpected:
+        fields = ", ".join(sorted(unexpected))
+        raise ValueError(f"Non-semantic event payload field: {fields}")
+    missing = set(schema.required).difference(copied)
+    if missing:
+        fields = ", ".join(sorted(missing))
+        raise ValueError(f"Event payload is missing required field: {fields}")
+    validators = {**schema.required, **schema.optional}
+    for field, validator in validators.items():
+        if field in copied and not validator(copied[field]):
+            raise ValueError(f"Invalid semantic event payload field: {field}")
     return copied
 
 
@@ -525,21 +653,6 @@ def _copy_json_object(payload: Mapping[str, JsonValue]) -> dict[str, JsonValue]:
     ):
         raise TypeError("Event payload must be a JSON object.")
     return cast(dict[str, JsonValue], decoded)
-
-
-def _walk_payload_keys(payload: JsonValue) -> tuple[str, ...]:
-    if isinstance(payload, dict):
-        keys: list[str] = []
-        for key, value in payload.items():
-            keys.append(key)
-            keys.extend(_walk_payload_keys(value))
-        return tuple(keys)
-    if isinstance(payload, list):
-        keys = []
-        for value in payload:
-            keys.extend(_walk_payload_keys(value))
-        return tuple(keys)
-    return ()
 
 
 def _load_json_object(raw: str | None) -> dict[str, object] | None:
