@@ -38,6 +38,7 @@ async def test_json_cli_reports_supervisor_connection_failure(
             str(tmp_path / "missing.sock"),
             "status",
             "worker-1",
+            "--no-start-supervisor",
             "--json",
         ],
         stdin=StringIO(),
@@ -52,6 +53,52 @@ async def test_json_cli_reports_supervisor_connection_failure(
             "message": "qworker supervisor is unavailable.",
         },
     }
+
+
+async def test_json_list_auto_starts_supervisor(tmp_path: Path) -> None:
+    socket_path = tmp_path / "runtime" / "qworker.sock"
+    state_dir = tmp_path / "state"
+    supervisor: Supervisor | None = None
+    server: RPCServer | None = None
+    launches = 0
+
+    async def launch(requested_socket: Path, requested_state_dir: Path) -> None:
+        nonlocal launches, server, supervisor
+        launches += 1
+        assert requested_socket == socket_path
+        assert requested_state_dir == state_dir
+        supervisor = Supervisor(
+            WorkerStore(requested_state_dir),
+            lambda _: GatedFakeQoderTransport(asyncio.Event()),
+            sdk_version="1.0.13",
+        )
+        server = RPCServer(supervisor, requested_socket)
+        await server.start()
+
+    stdout = StringIO()
+    try:
+        exit_code = await run(
+            [
+                "--socket",
+                str(socket_path),
+                "--state-dir",
+                str(state_dir),
+                "list",
+                "--json",
+            ],
+            stdin=StringIO(),
+            stdout=stdout,
+            supervisor_launcher=launch,
+        )
+
+        assert exit_code == 0
+        assert json.loads(stdout.getvalue()) == {"workers": [], "count": 0}
+        assert launches == 1
+    finally:
+        if server is not None:
+            await server.close()
+        if supervisor is not None:
+            await supervisor.close()
 
 
 async def test_json_spawn_can_disable_supervisor_auto_start(tmp_path: Path) -> None:
@@ -74,9 +121,7 @@ async def test_json_spawn_can_disable_supervisor_auto_start(tmp_path: Path) -> N
     )
 
     assert exit_code == 3
-    assert json.loads(stdout.getvalue())["error"]["code"] == (
-        "supervisor_unavailable"
-    )
+    assert json.loads(stdout.getvalue())["error"]["code"] == "supervisor_unavailable"
 
 
 @pytest.mark.parametrize("input_mode", ("spec_file", "stdin"))
@@ -293,6 +338,7 @@ async def test_qworker_console_entrypoint_emits_json_connection_error(
         str(tmp_path / "missing.sock"),
         "status",
         "worker-1",
+        "--no-start-supervisor",
         "--json",
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -341,9 +387,7 @@ async def test_follow_watch_disconnect_after_ack_is_structured_failure(
             writer.close()
             await writer.wait_closed()
 
-    server = await asyncio.start_unix_server(
-        acknowledge_then_drop, path=socket_path
-    )
+    server = await asyncio.start_unix_server(acknowledge_then_drop, path=socket_path)
     stdout = StringIO()
 
     exit_code = await run(

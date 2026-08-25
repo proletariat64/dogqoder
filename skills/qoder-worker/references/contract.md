@@ -8,6 +8,16 @@ Add `--json` to every command. Treat stdout as JSON or JSON Lines only and inspe
 
 Keep credentials and substantial content out of command arguments. Put spawn prompts and specifications in `--spec-file`, steering text in `--message-file`, approval objects in `--response-file`, or pipe the corresponding content on stdin. Worker IDs, message IDs, request IDs, cursors, roles, paths, models, priorities, and flags remain normal arguments.
 
+Invoke `qworker` directly from `PATH`. Do not assume dogqoder is the current
+repository, substitute `uv run`, or start `python -m qworker.rpc` yourself. If
+the console script is unavailable, stop and report that the dogqoder CLI needs
+a user-level installation.
+
+Every supervisor-backed command lazily starts the per-user supervisor when its
+socket is unavailable. Startup alone does not contact Qoder or consume credits.
+Use `--no-start-supervisor` only when the caller explicitly needs fail-fast
+connection behavior.
+
 Check configured runtime and authentication readiness when requested or when spawn reports a preflight failure:
 
 ```text

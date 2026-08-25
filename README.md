@@ -72,6 +72,22 @@ uv sync
 uv run python -c "import qoder_agent_sdk; print('Qoder SDK ready')"
 ```
 
+Install the public CLI for the current user so the Codex skill can invoke it
+from any workspace:
+
+```bash
+uv tool install --editable .
+qworker doctor --json
+```
+
+The editable install is intended for development checkouts. Release installs
+should use a published package or an immutable Git revision instead.
+
+Every supervisor-backed CLI command lazily starts the per-user supervisor when
+needed. This startup does not contact Qoder by itself. Add
+`--no-start-supervisor` to a command only when fail-fast connection behavior is
+required.
+
 For unattended SDK sessions, configure `QODER_PERSONAL_ACCESS_TOKEN` in the
 calling environment. The value must never be committed or written to project
 configuration.
@@ -114,6 +130,11 @@ intent selects a coder, and ambiguity stays read-only. Independent audits may
 activate proactively; proactive coding requires effective project policy to
 enable it. All lifecycle interaction consumes JSON, with mutation-aware
 fallback once a coder may have touched the shared workspace.
+
+For local skill development, use a user-level symlink from the Codex skills
+directory to `skills/qoder-worker` so contract edits are visible without
+reinstalling a snapshot. Distributed installs should copy the versioned skill
+from the repository.
 
 ## Core mechanisms
 
