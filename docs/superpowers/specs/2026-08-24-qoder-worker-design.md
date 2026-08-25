@@ -146,7 +146,11 @@ Common behavior:
 - Exit code `0` means the RPC command was accepted, not that an asynchronous worker completed.
 - Validation and connection failures use nonzero exit codes and structured errors on stdout when `--json` is present.
 - Large prompts are accepted through `--prompt-file`, `--spec-file`, or stdin. Secrets and full prompts are not placed in process arguments.
-- The CLI auto-starts the supervisor for `spawn`, unless `--no-start-supervisor` is supplied.
+- Every supervisor-backed CLI command auto-starts the supervisor when needed,
+  unless `--no-start-supervisor` is supplied. Starting the supervisor alone
+  does not contact Qoder or consume credits.
+- User-level installations expose the public `qworker` console script on
+  `PATH`; skills do not depend on a repository-local virtual environment.
 
 ### 6.3 Supervisor
 

@@ -21,7 +21,6 @@ from qoder_agent_sdk import (
     list_subagents,
 )
 
-
 logging.basicConfig(level=logging.INFO)
 REPO_ROOT = Path(__file__).resolve().parents[1]
 

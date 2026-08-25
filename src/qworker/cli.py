@@ -6,7 +6,7 @@ import json
 import os
 import subprocess
 import sys
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import NoReturn, TextIO, cast
 
@@ -18,6 +18,8 @@ from qworker.preflight import (
 )
 from qworker.rpc import RPCClientError, call, default_state_dir, watch
 from qworker.store import JsonValue
+
+SupervisorLauncher = Callable[[Path, Path], Awaitable[None]]
 
 
 class _ValidationError(Exception):
@@ -35,6 +37,7 @@ async def run(
     stdin: TextIO,
     stdout: TextIO,
     doctor_runner: PreflightRunner | None = None,
+    supervisor_launcher: SupervisorLauncher | None = None,
 ) -> int:
     """Run one CLI invocation and return its process exit code."""
 
@@ -49,6 +52,20 @@ async def run(
             )
             _write_json(stdout, doctor_result.to_json())
             return 0 if doctor_result.ok else 1
+        state_dir = cast(Path, arguments.state_dir)
+        start_supervisor = not cast(bool, arguments.no_start_supervisor)
+        launcher = supervisor_launcher or _start_supervisor
+
+        async def request(method: str, params: dict[str, JsonValue]) -> JsonValue:
+            return await _call_with_supervisor(
+                socket_path,
+                state_dir,
+                method,
+                params,
+                start_supervisor=start_supervisor,
+                supervisor_launcher=launcher,
+            )
+
         if arguments.command == "spawn":
             objective = _read_objective(arguments.spec_file, stdin)
             role = cast(str, arguments.role)
@@ -61,37 +78,29 @@ async def run(
                 "model": model,
                 "objective": objective,
             }
-            result = await _spawn(
-                socket_path,
-                cast(Path, arguments.state_dir),
-                params,
-                start_supervisor=not cast(bool, arguments.no_start_supervisor),
-            )
+            result = await request("spawn", params)
             _write_json(stdout, result)
             return 0
         if arguments.command == "list":
-            result = await call(socket_path, "list", {})
+            result = await request("list", {})
             _write_json(stdout, result)
             return 0
         if arguments.command == "status":
-            result = await call(
-                socket_path,
+            result = await request(
                 "status",
                 {"worker_id": cast(str, arguments.worker_id)},
             )
             _write_json(stdout, result)
             return 0
         if arguments.command == "result":
-            result = await call(
-                socket_path,
+            result = await request(
                 "result",
                 {"worker_id": cast(str, arguments.worker_id)},
             )
             _write_json(stdout, result)
             return 0
         if arguments.command == "resume":
-            result = await call(
-                socket_path,
+            result = await request(
                 "resume",
                 {"worker_id": cast(str, arguments.worker_id)},
             )
@@ -103,6 +112,7 @@ async def run(
                 "since": cast(int, arguments.since),
                 "follow": cast(bool, arguments.follow),
             }
+            await request("list", {})
             async for event in watch(socket_path, watch_params):
                 _write_json(stdout, event)
             return 0
@@ -120,12 +130,11 @@ async def run(
             agent_id = cast(str | None, arguments.agent_id)
             if agent_id is not None:
                 steer_params["agent_id"] = agent_id
-            result = await call(socket_path, "steer", steer_params)
+            result = await request("steer", steer_params)
             _write_json(stdout, result)
             return 0
         if arguments.command == "cancel-message":
-            result = await call(
-                socket_path,
+            result = await request(
                 "cancel_message",
                 {
                     "worker_id": cast(str, arguments.worker_id),
@@ -142,7 +151,7 @@ async def run(
             agent_id = cast(str | None, arguments.agent_id)
             if agent_id is not None:
                 stop_params["agent_id"] = agent_id
-            result = await call(socket_path, "stop", stop_params)
+            result = await request("stop", stop_params)
             _write_json(stdout, result)
             return 0
         if arguments.command == "respond":
@@ -161,8 +170,7 @@ async def run(
                 isinstance(key, str) for key in decoded
             ):
                 raise _ValidationError("approval response must be one JSON object")
-            result = await call(
-                socket_path,
+            result = await request(
                 "respond",
                 {
                     "worker_id": cast(str, arguments.worker_id),
@@ -226,24 +234,29 @@ def _parser() -> _ArgumentParser:
     spawn.add_argument("--json", action="store_true")
 
     list_parser = commands.add_parser("list")
+    list_parser.add_argument("--no-start-supervisor", action="store_true")
     list_parser.add_argument("--json", action="store_true")
 
     status = commands.add_parser("status")
     status.add_argument("worker_id")
+    status.add_argument("--no-start-supervisor", action="store_true")
     status.add_argument("--json", action="store_true")
 
     result = commands.add_parser("result")
     result.add_argument("worker_id")
+    result.add_argument("--no-start-supervisor", action="store_true")
     result.add_argument("--json", action="store_true")
 
     resume = commands.add_parser("resume")
     resume.add_argument("worker_id")
+    resume.add_argument("--no-start-supervisor", action="store_true")
     resume.add_argument("--json", action="store_true")
 
     watch_parser = commands.add_parser("watch")
     watch_parser.add_argument("worker_id")
     watch_parser.add_argument("--since", type=int, default=0)
     watch_parser.add_argument("--follow", action="store_true")
+    watch_parser.add_argument("--no-start-supervisor", action="store_true")
     watch_parser.add_argument("--json", action="store_true")
 
     steer = commands.add_parser("steer")
@@ -251,23 +264,27 @@ def _parser() -> _ArgumentParser:
     steer.add_argument("--priority", choices=("now", "next", "later"), default="next")
     steer.add_argument("--message-file", type=Path)
     steer.add_argument("--agent-id")
+    steer.add_argument("--no-start-supervisor", action="store_true")
     steer.add_argument("--json", action="store_true")
 
     cancel_message = commands.add_parser("cancel-message")
     cancel_message.add_argument("worker_id")
     cancel_message.add_argument("message_id")
+    cancel_message.add_argument("--no-start-supervisor", action="store_true")
     cancel_message.add_argument("--json", action="store_true")
 
     stop = commands.add_parser("stop")
     stop.add_argument("worker_id")
     stop.add_argument("--force", action="store_true")
     stop.add_argument("--agent-id")
+    stop.add_argument("--no-start-supervisor", action="store_true")
     stop.add_argument("--json", action="store_true")
 
     respond = commands.add_parser("respond")
     respond.add_argument("worker_id")
     respond.add_argument("request_id")
     respond.add_argument("--response-file", type=Path)
+    respond.add_argument("--no-start-supervisor", action="store_true")
     respond.add_argument("--json", action="store_true")
 
     doctor = commands.add_parser("doctor")
@@ -304,34 +321,39 @@ def _read_required_text(
     return value
 
 
-async def _spawn(
+async def _call_with_supervisor(
     socket_path: Path,
     state_dir: Path,
+    method: str,
     params: dict[str, JsonValue],
     *,
     start_supervisor: bool,
+    supervisor_launcher: SupervisorLauncher,
 ) -> JsonValue:
     try:
-        return await call(socket_path, "spawn", params)
+        return await call(socket_path, method, params)
     except RPCClientError as error:
         if error.code != "supervisor_unavailable" or not start_supervisor:
             raise
 
-    process = await asyncio.to_thread(
-        _launch_supervisor,
-        socket_path,
-        state_dir,
-    )
+    try:
+        await supervisor_launcher(socket_path, state_dir)
+    except OSError:
+        raise RPCClientError(
+            "supervisor_unavailable", "qworker supervisor is unavailable."
+        ) from None
     for _ in range(40):
-        if process.poll() is not None:
-            break
         try:
-            return await call(socket_path, "spawn", params)
+            return await call(socket_path, method, params)
         except RPCClientError as error:
             if error.code != "supervisor_unavailable":
                 raise
         await asyncio.sleep(0.05)
     raise RPCClientError("supervisor_unavailable", "qworker supervisor is unavailable.")
+
+
+async def _start_supervisor(socket_path: Path, state_dir: Path) -> None:
+    await asyncio.to_thread(_launch_supervisor, socket_path, state_dir)
 
 
 def _launch_supervisor(socket_path: Path, state_dir: Path) -> subprocess.Popen[bytes]:
